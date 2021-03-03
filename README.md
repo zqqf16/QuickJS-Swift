@@ -1,3 +1,4 @@
-# QuickJSSwift
+# QuickJS-Swift
 
-A description of this package.
+Swift bindings to QuickJS.
+
