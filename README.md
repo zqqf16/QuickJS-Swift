@@ -39,7 +39,7 @@ context.module("Magic") {
 
 let getMagic = """
 "use strict";
-import { getMagic, getMagic2 } from 'swift'
+import { getMagic, getMagic2 } from 'Magic'
 globalThis.magic = getMagic();
 globalThis.magic2 = getMagic2();
 """
