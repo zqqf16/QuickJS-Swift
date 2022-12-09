@@ -5,6 +5,9 @@ import PackageDescription
 
 let package = Package(
     name: "QuickJS",
+    platforms: [
+        .tvOS(.v11),
+    ],
     products: [
         // Products define the executables and libraries a package produces, and make them visible to other packages.
         .library(
@@ -21,7 +24,12 @@ let package = Package(
         .target(
             name: "QuickJSC",
             dependencies: [],
-            path: "Sources/QuickJSC"),
+            path: "Sources/QuickJSC",
+            exclude: [
+                // The Standard Library is not supported, since it exposes some
+                // operating system level things that aren't applicable to tvOS
+                "./quickjs-libc.c"
+            ]),
         .target(
             name: "QuickJS",
             dependencies: ["QuickJSC"]),

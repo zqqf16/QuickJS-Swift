@@ -1,5 +1,4 @@
 module QuickJSC {
     header "quickjs.h"
-	header "quickjs-libc.h"
     export *
 }

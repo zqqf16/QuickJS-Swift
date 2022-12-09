@@ -31,9 +31,9 @@ public class JSRuntime {
             return nil
         }
         
-        let _ = js_init_module_std(ctx, "std")
-        let _ = js_init_module_std(ctx, "os")
-        js_std_add_helpers(ctx, -1, nil)
+        //let _ = js_init_module_std(ctx, "std")
+        //let _ = js_init_module_std(ctx, "os")
+        //js_std_add_helpers(ctx, -1, nil)
 
         return ctx
     }
@@ -43,9 +43,9 @@ public class JSRuntime {
             return nil
         }
         self.jsInstance = runtime
-        js_std_set_worker_new_context_func(JSRuntime.contextBuilder);
-        js_std_init_handlers(runtime);
-        JS_SetModuleLoaderFunc(runtime, nil, js_module_loader, nil);
+        //js_std_set_worker_new_context_func(JSRuntime.contextBuilder);
+        //js_std_init_handlers(runtime);
+        //JS_SetModuleLoaderFunc(runtime, nil, js_module_loader, nil);
     }
     
     deinit {
