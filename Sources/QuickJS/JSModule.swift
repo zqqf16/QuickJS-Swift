@@ -68,7 +68,7 @@ fileprivate struct JSModuleCombineProperty : JSModuleProperty {
 
 @resultBuilder
 public struct ModuleBuilder {
-    static func buildBlock(_ components: JSModuleProperty...) -> JSModuleProperty {
+    public static func buildBlock(_ components: JSModuleProperty...) -> JSModuleProperty {
         return JSModuleCombineProperty(components)
     }
 }
