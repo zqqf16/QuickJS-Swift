@@ -116,9 +116,22 @@ public class JSFunction: JSValue {
                 return context.makeThrownError(error)
             }
             if let value = result as? JSValue {
+                if let error = value.cachedError ?? value.error {
+                    return context.makeThrownError(error)
+                }
+                if JS_IsException(value.cValue) != 0 {
+                    return context.makeThrownError(.exception("JavaScript exception"))
+                }
                 return value.jsValue(context).steal()
             }
-            return result.jsValue(context).steal()
+            let jsValue = result.jsValue(context)
+            if JS_HasException(context.core.context) != 0 {
+                return .exception
+            }
+            return jsValue.steal()
+        }
+        if JS_HasException(context.core.context) != 0 {
+            return .exception
         }
         return .undefined
     }

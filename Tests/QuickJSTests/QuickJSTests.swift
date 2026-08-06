@@ -139,6 +139,24 @@ final class QuickJSSwiftTests: XCTestCase {
         let callFailed = context.call(fn)
         XCTAssertTrue(callFailed.isException)
         XCTAssertEqual(try context.evaluate("3 + 3;").int, 6)
+
+        // Non-stringifiable throw must not leave a pending conversion exception.
+        let symbolThrow = context.eval("throw Symbol('x');")
+        XCTAssertTrue(symbolThrow.isException)
+        XCTAssertEqual(try context.evaluate("5 + 5;").int, 10)
+
+        context.module("Conv") {
+            JSModuleFunction("asString", argc: 1) { context, _, argc, argv in
+                guard argc >= 1, let argv = argv else { return nil }
+                return String(context, value: argv[0])
+            }
+        }
+        try context.evaluate("""
+        import { asString } from 'Conv'
+        globalThis.convOk = asString(Symbol('s')) === undefined
+        """, options: EvalOptions(type: .module))
+        XCTAssertEqual(context.eval("convOk;").bool, true)
+        XCTAssertEqual(try context.evaluate("6 + 6;").int, 12)
     }
 
     func testHostThrowAndJSValueReturn() throws {

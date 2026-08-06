@@ -262,6 +262,9 @@ public class JSContext {
                 break
             }
             if status < 0 {
+                if let ctx = ctx, let jobContext = ctx.opaqueContext {
+                    throw jobContext.mapException()
+                }
                 throw mapException()
             }
             executed += 1

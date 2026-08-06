@@ -101,6 +101,8 @@ public final class JSRuntime {
             box.lastMessage = String(cString: cString)
             JS_FreeCString(ctx, cString)
         } else {
+            let exception = JS_GetException(ctx)
+            JS_FreeValue(ctx, exception)
             box.lastMessage = "Unhandled promise rejection"
         }
     }

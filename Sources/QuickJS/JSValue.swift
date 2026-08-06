@@ -35,6 +35,10 @@ extension JSCValue {
     static var undefined: JSCValue {
         JSCValue(u: JSValueUnion(uint64: 0), tag: Int64(JS_TAG_UNDEFINED))
     }
+
+    static var exception: JSCValue {
+        JSCValue(u: JSValueUnion(uint64: 0), tag: Int64(JS_TAG_EXCEPTION))
+    }
 }
 
 public class JSValue {
@@ -145,7 +149,14 @@ extension JSValue {
     public var isObject: Bool { JS_IsObject(cValue) != 0 }
 
     public var isArray: Bool {
-        withEngine { JS_IsArray($0.core.context, cValue) != 0 } ?? false
+        withEngine { context in
+            let result = JS_IsArray(context.core.context, cValue)
+            if result < 0 {
+                context.clearException()
+                return false
+            }
+            return result == 1
+        } ?? false
     }
 
     public var isDate: Bool {
@@ -191,7 +202,10 @@ extension ConvertibleWithJavascript {
 
 extension String: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard let cString = JS_ToCString(context.core.context, value) else { return nil }
+        guard let cString = JS_ToCString(context.core.context, value) else {
+            context.clearException()
+            return nil
+        }
         self.init(cString: cString)
         JS_FreeCString(context.core.context, cString)
     }
@@ -204,7 +218,10 @@ extension String: ConvertibleWithJavascript {
 extension Bool: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
         let result = JS_ToBool(context.core.context, value)
-        if result < 0 { return nil }
+        if result < 0 {
+            context.clearException()
+            return nil
+        }
         self = result != 0
     }
 
@@ -217,7 +234,10 @@ extension Int32: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
         guard JS_IsNumber(value) != 0 else { return nil }
         var pres: Int32 = 0
-        if JS_ToInt32(context.core.context, &pres, value) < 0 { return nil }
+        if JS_ToInt32(context.core.context, &pres, value) < 0 {
+            context.clearException()
+            return nil
+        }
         self = pres
     }
 
@@ -230,7 +250,10 @@ extension UInt32: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
         guard JS_IsNumber(value) != 0 else { return nil }
         var pres: UInt32 = 0
-        if JS_ToUint32(context.core.context, &pres, value) < 0 { return nil }
+        if JS_ToUint32(context.core.context, &pres, value) < 0 {
+            context.clearException()
+            return nil
+        }
         self = pres
     }
 
@@ -243,7 +266,10 @@ extension Int64: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
         guard JS_IsNumber(value) != 0 else { return nil }
         var pres: Int64 = 0
-        if JS_ToInt64(context.core.context, &pres, value) < 0 { return nil }
+        if JS_ToInt64(context.core.context, &pres, value) < 0 {
+            context.clearException()
+            return nil
+        }
         self = pres
     }
 
@@ -281,7 +307,10 @@ extension Double: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
         guard JS_IsNumber(value) != 0 else { return nil }
         var pres: Double = 0
-        if JS_ToFloat64(context.core.context, &pres, value) < 0 { return nil }
+        if JS_ToFloat64(context.core.context, &pres, value) < 0 {
+            context.clearException()
+            return nil
+        }
         self = pres
     }
 
@@ -292,19 +321,35 @@ extension Double: ConvertibleWithJavascript {
 
 extension Array: ConvertibleWithJavascript where Element: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard JS_IsArray(context.core.context, value) != 0 else { return nil }
+        let isArray = JS_IsArray(context.core.context, value)
+        if isArray < 0 {
+            context.clearException()
+            return nil
+        }
+        guard isArray == 1 else { return nil }
 
         let length = JS_GetPropertyStr(context.core.context, value, "length")
         defer { context.core.free(length) }
+        if JS_IsException(length) != 0 {
+            context.clearException()
+            return nil
+        }
 
         var size: UInt64 = 0
-        if JS_ToIndex(context.core.context, &size, length) < 0 { return nil }
+        if JS_ToIndex(context.core.context, &size, length) < 0 {
+            context.clearException()
+            return nil
+        }
 
         self = []
         reserveCapacity(Int(size))
         for index in 0..<size {
             let v = JS_GetPropertyUint32(context.core.context, value, UInt32(index))
             defer { context.core.free(v) }
+            if JS_IsException(v) != 0 {
+                context.clearException()
+                return nil
+            }
             guard let ele = Element(context, value: v) else { return nil }
             append(ele)
         }
@@ -321,13 +366,18 @@ extension Array: ConvertibleWithJavascript where Element: ConvertibleWithJavascr
 
 extension Dictionary: ConvertibleWithJavascript where Key == String, Value: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard JS_IsObject(value) != 0, JS_IsArray(context.core.context, value) == 0 else {
+        guard JS_IsObject(value) != 0 else { return nil }
+        let isArray = JS_IsArray(context.core.context, value)
+        if isArray < 0 {
+            context.clearException()
             return nil
         }
+        guard isArray == 0 else { return nil }
 
         var tab: UnsafeMutablePointer<JSPropertyEnum>?
         var len: UInt32 = 0
         if JS_GetOwnPropertyNames(context.core.context, &tab, &len, value, Int32(JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) != 0 {
+            context.clearException()
             return nil
         }
         defer {
@@ -340,12 +390,19 @@ extension Dictionary: ConvertibleWithJavascript where Key == String, Value: Conv
         guard let tab = tab else { return }
         for i in 0..<len {
             let atom = tab[Int(i)].atom
-            guard let keyCString = JS_AtomToCString(context.core.context, atom) else { return nil }
+            guard let keyCString = JS_AtomToCString(context.core.context, atom) else {
+                context.clearException()
+                return nil
+            }
             let key = String(cString: keyCString)
             JS_FreeCString(context.core.context, keyCString)
 
             let prop = JS_GetProperty(context.core.context, value, atom)
             defer { context.core.free(prop) }
+            if JS_IsException(prop) != 0 {
+                context.clearException()
+                return nil
+            }
             guard let converted = Value(context, value: prop) else { return nil }
             self[key] = converted
         }
@@ -410,7 +467,10 @@ extension Date: ConvertibleWithJavascript {
         }
 
         var millis: Double = 0
-        if JS_ToFloat64(context.core.context, &millis, result) < 0 { return nil }
+        if JS_ToFloat64(context.core.context, &millis, result) < 0 {
+            context.clearException()
+            return nil
+        }
         self.init(timeIntervalSince1970: millis / 1000)
     }
 

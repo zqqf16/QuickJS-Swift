@@ -99,7 +99,10 @@ enum JSTimers {
     static func clearTimeout(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?) {
         guard let argv = argv, argc >= 1 else { return }
         var id: Int64 = 0
-        if JS_ToInt64(context.core.context, &id, argv[0]) < 0 { return }
+        if JS_ToInt64(context.core.context, &id, argv[0]) < 0 {
+            context.clearException()
+            return
+        }
         cancel(on: context, id: UInt64(bitPattern: id))
     }
 

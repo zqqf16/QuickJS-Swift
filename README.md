@@ -4,6 +4,8 @@
 
 Swift bindings for [QuickJS](https://bellard.org/quickjs/) (`2026-06-04`), with a serial `DispatchQueue` event loop for timers and Promise jobs.
 
+**Current release:** `1.0.0`
+
 > QuickJS is single-threaded. All engine access is serialized through the runtime's `JSEventLoop`.
 
 ### Quick start
@@ -68,5 +70,5 @@ print(value.int!) // 42
 ### Swift Package Manager
 
 ```swift
-.package(url: "https://github.com/zqqf16/QuickJS-Swift.git", branch: "master")
+.package(url: "https://github.com/zqqf16/QuickJS-Swift.git", from: "1.0.0")
 ```
