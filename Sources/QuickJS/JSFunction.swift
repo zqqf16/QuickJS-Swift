@@ -67,6 +67,11 @@ public class JSFunction: JSValue {
         fatalError("JSFunction cannot wrap an existing JS value")
     }
 
+    @available(*, unavailable, message: "JSFunction cannot wrap an existing JS value")
+    public required convenience init?(_ context: JSContext, value: JSCValue) {
+        fatalError("JSFunction cannot wrap an existing JS value")
+    }
+
     func buildFunction() {
         guard let context = context, !didBuild else { return }
         didBuild = true
@@ -105,8 +110,14 @@ public class JSFunction: JSValue {
             return .undefined
         }
 
-        let thisObj = JSValue(context.core, value: this, dup: true)
+        let thisObj = JSValue(context, value: this, dup: true)
         if let result = block(context, thisObj, Int(argc), argv) {
+            if let error = result as? JSError {
+                return context.makeThrownError(error)
+            }
+            if let value = result as? JSValue {
+                return value.jsValue(context).steal()
+            }
             return result.jsValue(context).steal()
         }
         return .undefined

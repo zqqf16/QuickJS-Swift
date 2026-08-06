@@ -41,13 +41,18 @@ public class JSModuleFunction: JSFunction, JSModuleProperty {
         fatalError("JSModuleFunction cannot wrap an existing JS value")
     }
 
+    @available(*, unavailable, message: "JSModuleFunction cannot wrap an existing JS value")
+    public required convenience init?(_ context: JSContext, value: JSCValue) {
+        fatalError("JSModuleFunction cannot wrap an existing JS value")
+    }
+
     public func exportValue(in context: JSContext) -> JSValue {
         // First export transfers ownership of the C function value; later exports dup.
         if didExport {
-            return JSValue(context.core, value: cValue, dup: true, autoFree: true)
+            return JSValue(context, value: cValue, dup: true, autoFree: true)
         }
         didExport = true
-        return JSValue(context.core, value: cValue, dup: false, autoFree: false)
+        return JSValue(context, value: cValue, dup: false, autoFree: false)
     }
 
     public func add(to context: JSContext) {

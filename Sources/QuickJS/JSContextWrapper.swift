@@ -50,8 +50,17 @@ final class JSContextWrapper {
         self.context = context
     }
 
-    deinit {
+    private var didFreeContext = false
+
+    /// Free the underlying `JSContext *`. Safe to call more than once.
+    func freeContext() {
+        guard !didFreeContext else { return }
+        didFreeContext = true
         JS_FreeContext(context)
+    }
+
+    deinit {
+        freeContext()
     }
 
     var opaque: JSContext? {

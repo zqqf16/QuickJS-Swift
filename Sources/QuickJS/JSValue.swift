@@ -39,18 +39,46 @@ extension JSCValue {
 
 public class JSValue {
     var cValue: JSCValue
-    var context: JSContextWrapper?
+    /// Backing wrapper for host-function values that must not strongly retain `JSContext`
+    /// (the context already retains those functions).
+    private var storedContext: JSContextWrapper?
+    /// Weak back-reference used by host functions (context already retains them).
+    private weak var weakOwner: JSContext?
+    /// Strong owner for values created via the public `JSContext` APIs.
+    /// This is the sole retain path that keeps the C context / runtime alive.
+    private var retainedOwner: JSContext?
     var autoFree: Bool = true
+    /// Exception details captured when the pending runtime exception was cleared.
+    private(set) var cachedError: JSError?
+
+    var context: JSContextWrapper? {
+        get { retainedOwner?.core ?? storedContext }
+        set { storedContext = newValue }
+    }
 
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
-        self.context = context
+        self.storedContext = context
         self.autoFree = autoFree
+        self.weakOwner = context?.opaque
         if dup {
             precondition(context != nil, "dup requires a context")
             self.cValue = context!.dup(value)
         } else {
             self.cValue = value
         }
+    }
+
+    convenience init(_ jsContext: JSContext, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
+        // Intentionally do not retain `jsContext.core` separately; `retainedOwner`
+        // already owns it and must be the only Swift retain of the wrapper.
+        let owned = dup ? jsContext.core.dup(value) : value
+        self.init(nil, value: owned, dup: false, autoFree: autoFree)
+        self.weakOwner = jsContext
+        self.retainedOwner = jsContext
+    }
+
+    public required convenience init?(_ context: JSContext, value: JSCValue) {
+        self.init(context, value: value, dup: true)
     }
 
     func steal() -> JSCValue {
@@ -63,9 +91,30 @@ public class JSValue {
         JS_SetOpaque(cValue, ptr)
     }
 
+    func attach(owner: JSContext) {
+        self.weakOwner = owner
+        if retainedOwner == nil && storedContext == nil {
+            storedContext = owner.core
+        }
+    }
+
+    func noteException(_ error: JSError) {
+        cachedError = error
+    }
+
     deinit {
-        if autoFree {
-            context?.free(cValue)
+        guard autoFree else { return }
+        let value = cValue
+        if let owner = retainedOwner {
+            owner.runtime.perform {
+                owner.core.free(value)
+            }
+        } else if let owner = weakOwner {
+            owner.runtime.perform {
+                (storedContext ?? owner.core).free(value)
+            }
+        } else {
+            storedContext?.free(value)
         }
     }
 }
@@ -76,32 +125,35 @@ extension JSValue {
 }
 
 extension JSValue {
-    public var jsContext: JSContext? { context?.opaque }
+    public var jsContext: JSContext? { retainedOwner ?? weakOwner ?? context?.opaque }
 
-    public var isFunction: Bool {
-        guard let ctx = context?.context else { return false }
-        return JS_IsFunction(ctx, cValue) != 0
+    private func withEngine<T>(_ body: (JSContext) -> T) -> T? {
+        guard let jsContext = jsContext else { return nil }
+        return jsContext.runtime.perform {
+            body(jsContext)
+        }
     }
 
-    public var isException: Bool { JS_IsException(cValue) != 0 }
+    public var isFunction: Bool {
+        withEngine { JS_IsFunction($0.core.context, cValue) != 0 } ?? false
+    }
+
+    public var isException: Bool { JS_IsException(cValue) != 0 || cachedError != nil }
     public var isBool: Bool { JS_IsBool(cValue) != 0 }
     public var isNumber: Bool { JS_IsNumber(cValue) != 0 }
     public var isString: Bool { JS_IsString(cValue) != 0 }
     public var isObject: Bool { JS_IsObject(cValue) != 0 }
 
     public var isArray: Bool {
-        guard let ctx = context?.context else { return false }
-        return JS_IsArray(ctx, cValue) != 0
+        withEngine { JS_IsArray($0.core.context, cValue) != 0 } ?? false
     }
 
     public var isDate: Bool {
-        guard let jsContext = jsContext else { return false }
-        return jsContext.isDate(cValue)
+        withEngine { $0.isDate(cValue) } ?? false
     }
 
     public func getValue<T: ConvertibleWithJavascript>() -> T? {
-        guard let jsContext = jsContext else { return nil }
-        return T(jsContext, value: cValue)
+        withEngine { T($0, value: cValue) } ?? nil
     }
 
     public var double: Double? { getValue() }
@@ -112,8 +164,17 @@ extension JSValue {
     public var data: Data? { getValue() }
 
     public var error: JSError? {
-        guard isException, let jsContext = jsContext else { return nil }
-        return jsContext.mapException()
+        if let cachedError = cachedError {
+            return cachedError
+        }
+        guard isException else { return nil }
+        return withEngine { $0.mapException() }
+    }
+}
+
+extension JSValue: ConvertibleWithJavascript {
+    public func jsValue(_ context: JSContext) -> JSValue {
+        JSValue(context, value: cValue, dup: true)
     }
 }
 
@@ -136,7 +197,7 @@ extension String: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewString(context.core.context, self))
+        JSValue(context, value: JS_NewString(context.core.context, self))
     }
 }
 
@@ -148,7 +209,7 @@ extension Bool: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewBool(context.core.context, self ? 1 : 0))
+        JSValue(context, value: JS_NewBool(context.core.context, self ? 1 : 0))
     }
 }
 
@@ -161,7 +222,7 @@ extension Int32: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewInt32(context.core.context, self))
+        JSValue(context, value: JS_NewInt32(context.core.context, self))
     }
 }
 
@@ -174,7 +235,7 @@ extension UInt32: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewUint32(context.core.context, self))
+        JSValue(context, value: JS_NewUint32(context.core.context, self))
     }
 }
 
@@ -187,7 +248,7 @@ extension Int64: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewInt64(context.core.context, self))
+        JSValue(context, value: JS_NewInt64(context.core.context, self))
     }
 }
 
@@ -225,7 +286,7 @@ extension Double: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewFloat64(context.core.context, self))
+        JSValue(context, value: JS_NewFloat64(context.core.context, self))
     }
 }
 
@@ -254,7 +315,7 @@ extension Array: ConvertibleWithJavascript where Element: ConvertibleWithJavascr
         for (index, element) in enumerated() {
             _ = JS_SetPropertyUint32(context.core.context, array, UInt32(index), element.jsValue(context).steal())
         }
-        return JSValue(context.core, value: array)
+        return JSValue(context, value: array)
     }
 }
 
@@ -295,7 +356,7 @@ extension Dictionary: ConvertibleWithJavascript where Key == String, Value: Conv
         for (key, value) in self {
             _ = JS_SetPropertyStr(context.core.context, obj, key, value.jsValue(context).steal())
         }
-        return JSValue(context.core, value: obj)
+        return JSValue(context, value: obj)
     }
 }
 
@@ -331,7 +392,7 @@ extension Data: ConvertibleWithJavascript {
             }
             return JS_NewArrayBufferCopy(context.core.context, base, count)
         }
-        return JSValue(context.core, value: value)
+        return JSValue(context, value: value)
     }
 }
 
@@ -354,7 +415,7 @@ extension Date: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        JSValue(context.core, value: JS_NewDate(context.core.context, timeIntervalSince1970 * 1000))
+        JSValue(context, value: JS_NewDate(context.core.context, timeIntervalSince1970 * 1000))
     }
 }
 
@@ -372,6 +433,17 @@ public enum JSError: Error, Equatable {
     }
 }
 
+extension JSError: ConvertibleWithJavascript {
+    public init?(_ context: JSContext, value: JSCValue) {
+        nil
+    }
+
+    public func jsValue(_ context: JSContext) -> JSValue {
+        // Returning an error from a host function throws into JS.
+        JSValue(context, value: context.makeThrownError(self), autoFree: false)
+    }
+}
+
 extension JSContext {
     func isDate(_ value: JSCValue) -> Bool {
         guard JS_IsObject(value) != 0 else { return false }
@@ -386,5 +458,26 @@ extension JSContext {
             return false
         }
         return result != 0
+    }
+
+    func makeValue(_ value: JSCValue) -> JSValue {
+        let jsValue = JSValue(self, value: value, dup: false, autoFree: true)
+        if JS_IsException(value) != 0 {
+            jsValue.noteException(mapException())
+        }
+        return jsValue
+    }
+
+    func makeThrownError(_ error: JSError) -> JSCValue {
+        let err = JS_NewError(core.context)
+        let message = JS_NewString(core.context, error.message)
+        _ = JS_DefinePropertyValueStr(
+            core.context,
+            err,
+            "message",
+            message,
+            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+        )
+        return JS_Throw(core.context, err)
     }
 }

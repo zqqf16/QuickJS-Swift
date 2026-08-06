@@ -65,8 +65,32 @@ final class RunloopTests: XCTestCase {
         wait(for: [expectation], timeout: 2)
     }
 
+    func testSetTimeoutStringDelayAndCallbackException() throws {
+        let runtime = try XCTUnwrap(JSRuntime())
+        let context = try XCTUnwrap(runtime.createContext())
+        context.enableEventLoop()
+
+        let expectation = expectation(description: "string delay")
+        context.module("Waiter") {
+            JSModuleFunction("done", argc: 0) { _, _, _, _ in
+                expectation.fulfill()
+                return nil
+            }
+        }
+
+        try context.evaluate("""
+        import { done } from "Waiter"
+        setTimeout(() => { throw new Error("timer boom") }, "40")
+        setTimeout(() => done(), "80")
+        """, options: EvalOptions(type: .module))
+
+        wait(for: [expectation], timeout: 2)
+        XCTAssertEqual(try context.evaluate("1 + 1;").int, 2)
+    }
+
     static var allTests = [
         ("testSetTimeoutClearAndInterval", testSetTimeoutClearAndInterval),
         ("testRunloopModuleCompat", testRunloopModuleCompat),
+        ("testSetTimeoutStringDelayAndCallbackException", testSetTimeoutStringDelayAndCallbackException),
     ]
 }

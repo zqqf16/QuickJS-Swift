@@ -44,11 +44,12 @@ public class JSContext {
         runtime.perform {
             JSTimers.shutdown(for: self)
             core.opaque = nil
+            // Free the C context while Swift host/module functions are still alive.
+            // Do this explicitly: an extra Swift retain of `core` must not delay
+            // FreeContext until after `runtime` is released.
+            core.freeContext()
         }
-        // Property teardown order (reverse declaration):
-        // core → FreeContext (Swift functions still retained)
-        // modules / hostFunctions → release Swift callbacks
-        // runtime → may FreeRuntime when last context goes away
+        // Property teardown: modules / hostFunctions, then runtime.
     }
 
     public enum EvalType: Int32 {
@@ -73,8 +74,8 @@ public class JSContext {
                 options.filename,
                 options.rawFlags
             )
-            let result = JSValue(core, value: value)
-            if runtime.options.flushJobsAfterEval {
+            let result = makeValue(value)
+            if !result.isException, runtime.options.flushJobsAfterEval {
                 _ = try? flushPendingJobsUnlocked()
             }
             return result
@@ -91,9 +92,9 @@ public class JSContext {
                 options.filename,
                 options.rawFlags
             )
-            let result = JSValue(core, value: value)
-            if result.isException {
-                throw mapException()
+            let result = makeValue(value)
+            if let error = result.cachedError {
+                throw error
             }
             if runtime.options.flushJobsAfterEval {
                 try flushPendingJobsUnlocked()
@@ -154,9 +155,9 @@ public class JSContext {
                 }
             }
 
-            let result = JSValue(core, value: JS_EvalFunction(core.context, value))
-            if result.isException {
-                throw mapException()
+            let result = makeValue(JS_EvalFunction(core.context, value))
+            if let error = result.cachedError {
+                throw error
             }
             if runtime.options.flushJobsAfterEval {
                 try flushPendingJobsUnlocked()
@@ -180,8 +181,8 @@ public class JSContext {
                     JS_Call(core.context, function.cValue, thisValue, Int32(buffer.count), buffer.baseAddress)
                 }
             }
-            let jsValue = JSValue(core, value: result)
-            if runtime.options.flushJobsAfterEval {
+            let jsValue = makeValue(result)
+            if !jsValue.isException, runtime.options.flushJobsAfterEval {
                 _ = try? flushPendingJobsUnlocked()
             }
             return jsValue
@@ -208,7 +209,7 @@ public class JSContext {
         runtime.perform {
             let globalObj = JS_GetGlobalObject(core.context)
             defer { JS_FreeValue(core.context, globalObj) }
-            return JSValue(core, value: JS_GetPropertyStr(core.context, globalObj, name))
+            return makeValue(JS_GetPropertyStr(core.context, globalObj, name))
         }
     }
 

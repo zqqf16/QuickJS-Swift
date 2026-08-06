@@ -106,16 +106,21 @@ enum JSTimers {
     private static func schedule(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?, repeating: Bool) -> Int64? {
         guard let argv = argv, argc >= 2 else { return nil }
 
-        let function = JSValue(context.core, value: argv[0], dup: true)
+        let function = JSValue(context, value: argv[0], dup: true)
         guard function.isFunction else { return nil }
 
-        let rawDelay = JSValue(context.core, value: argv[1]).double ?? 0
+        // Coerce delay without taking ownership of argv[1].
+        var rawDelay: Double = 0
+        if JS_ToFloat64(context.core.context, &rawDelay, argv[1]) < 0 {
+            context.clearException()
+            rawDelay = 0
+        }
         let delayMs = rawDelay.isFinite ? max(rawDelay, 0) : 0
         let extraArgc = max(argc - 2, 0)
         var args: [JSValue] = []
         args.reserveCapacity(extraArgc)
         for i in 0..<extraArgc {
-            args.append(JSValue(context.core, value: argv[2 + i], dup: true))
+            args.append(JSValue(context, value: argv[2 + i], dup: true))
         }
 
         let state = state(for: context)
@@ -137,7 +142,9 @@ enum JSTimers {
             guard let (fn, retainedArgs) = snapshot else { return }
 
             _ = try? context.flushPendingJobs()
-            _ = context.call(fn, arguments: retainedArgs)
+            let result = context.call(fn, arguments: retainedArgs)
+            // `call` clears pending exceptions; ignore callback failures here.
+            _ = result.error
 
             if !repeating {
                 cancel(on: context, id: timerKey)

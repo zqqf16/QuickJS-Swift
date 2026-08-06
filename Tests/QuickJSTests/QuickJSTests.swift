@@ -1,6 +1,5 @@
 import XCTest
 @testable import QuickJS
-import QuickJSC
 
 final class QuickJSSwiftTests: XCTestCase {
     func testEvalAndGlobals() throws {
@@ -127,6 +126,76 @@ final class QuickJSSwiftTests: XCTestCase {
         _ = runtime
     }
 
+    func testExceptionDoesNotPoisonContext() throws {
+        let runtime = try XCTUnwrap(JSRuntime())
+        let context = try XCTUnwrap(runtime.createContext())
+
+        let failed = context.eval("throw new Error('poison');")
+        XCTAssertTrue(failed.isException)
+        XCTAssertNotNil(failed.error)
+        XCTAssertEqual(try context.evaluate("2 + 2;").int, 4)
+
+        let fn = try context.evaluate("function boom(){ throw new Error('call'); }; boom;")
+        let callFailed = context.call(fn)
+        XCTAssertTrue(callFailed.isException)
+        XCTAssertEqual(try context.evaluate("3 + 3;").int, 6)
+    }
+
+    func testHostThrowAndJSValueReturn() throws {
+        let runtime = try XCTUnwrap(JSRuntime())
+        let context = try XCTUnwrap(runtime.createContext())
+
+        context.module("Host") {
+            JSModuleFunction("fail", argc: 0) { _, _, _, _ in
+                JSError.exception("from-swift")
+            }
+            JSModuleFunction("wrap", argc: 1) { context, _, argc, argv in
+                guard argc >= 1, let argv = argv else { return nil }
+                return JSValue(context, value: argv[0], dup: true)
+            }
+        }
+
+        try context.evaluate("""
+        import { fail, wrap } from 'Host'
+        globalThis.wrapped = wrap(99)
+        try { fail(); globalThis.ok = false } catch (e) {
+          globalThis.ok = String(e).includes('from-swift')
+        }
+        """, options: EvalOptions(type: .module))
+
+        XCTAssertEqual(context.eval("wrapped;").int, 99)
+        XCTAssertEqual(context.eval("ok;").bool, true)
+    }
+
+    func testPromiseRejectionTracker() throws {
+        let runtime = try XCTUnwrap(JSRuntime())
+        let context = try XCTUnwrap(runtime.createContext())
+
+        try context.evaluate("Promise.reject(new Error('rejected'));")
+        let message = try XCTUnwrap(runtime.takeUnhandledPromiseRejection())
+        XCTAssertTrue(message.contains("rejected"))
+        XCTAssertNil(runtime.takeUnhandledPromiseRejection())
+    }
+
+    func testJSValueKeepsContextAlive() throws {
+        var value: QuickJS.JSValue?
+        weak var weakContext: JSContext?
+        weak var weakRuntime: JSRuntime?
+        do {
+            let runtime = try XCTUnwrap(JSRuntime(options: JSRuntimeOptions(enableHelpers: false)))
+            weakRuntime = runtime
+            let context = try XCTUnwrap(runtime.createContext())
+            weakContext = context
+            value = try context.evaluate("'alive';")
+        }
+        XCTAssertNotNil(weakContext, "JSValue should keep its JSContext alive")
+        XCTAssertNotNil(weakRuntime, "JSContext should keep its JSRuntime alive")
+        XCTAssertEqual(value?.string, "alive")
+        value = nil
+        XCTAssertNil(weakContext)
+        XCTAssertNil(weakRuntime)
+    }
+
     static var allTests = [
         ("testEvalAndGlobals", testEvalAndGlobals),
         ("testNativeModuleAndValues", testNativeModuleAndValues),
@@ -135,5 +204,9 @@ final class QuickJSSwiftTests: XCTestCase {
         ("testInterrupt", testInterrupt),
         ("testBytecodeAndPromises", testBytecodeAndPromises),
         ("testTimerTeardown", testTimerTeardown),
+        ("testExceptionDoesNotPoisonContext", testExceptionDoesNotPoisonContext),
+        ("testHostThrowAndJSValueReturn", testHostThrowAndJSValueReturn),
+        ("testPromiseRejectionTracker", testPromiseRejectionTracker),
+        ("testJSValueKeepsContextAlive", testJSValueKeepsContextAlive),
     ]
 }

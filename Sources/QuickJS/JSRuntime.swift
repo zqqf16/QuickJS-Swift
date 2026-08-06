@@ -32,10 +32,11 @@ private final class RejectionBox {
     var lastMessage: String?
 }
 
-/// Ref-counts process-global QuickJS std worker hooks.
+/// Ref-counts process-global QuickJS std worker hooks and helper flags.
 private enum StdModulesGate {
     private static let lock = NSLock()
     private static var refCount = 0
+    private static var helpersByRuntime = [UnsafeMutableRawPointer: Bool]()
 
     static func acquire(builder: @escaping @convention(c) (OpaquePointer?) -> OpaquePointer?) {
         lock.lock()
@@ -51,6 +52,24 @@ private enum StdModulesGate {
         if refCount == 0 {
             js_std_set_worker_new_context_func(nil)
         }
+    }
+
+    static func setHelpersEnabled(_ runtime: OpaquePointer, _ enabled: Bool) {
+        lock.lock()
+        helpersByRuntime[UnsafeMutableRawPointer(runtime)] = enabled
+        lock.unlock()
+    }
+
+    static func helpersEnabled(_ runtime: OpaquePointer) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return helpersByRuntime[UnsafeMutableRawPointer(runtime)] ?? true
+    }
+
+    static func removeHelpersFlag(_ runtime: OpaquePointer) {
+        lock.lock()
+        helpersByRuntime.removeValue(forKey: UnsafeMutableRawPointer(runtime))
+        lock.unlock()
     }
 }
 
@@ -90,7 +109,9 @@ public final class JSRuntime {
         guard let rt = rt, let ctx = JS_NewContext(rt) else { return nil }
         _ = js_init_module_std(ctx, "std")
         _ = js_init_module_os(ctx, "os")
-        js_std_add_helpers(ctx, -1, nil)
+        if StdModulesGate.helpersEnabled(rt) {
+            js_std_add_helpers(ctx, -1, nil)
+        }
         return ctx
     }
 
@@ -128,6 +149,7 @@ public final class JSRuntime {
         )
 
         if options.enableStdModules {
+            StdModulesGate.setHelpersEnabled(runtime, options.enableHelpers)
             StdModulesGate.acquire(builder: JSRuntime.contextBuilder)
             js_std_init_handlers(runtime)
             JS_SetModuleLoaderFunc2(runtime, nil, js_module_loader, js_module_check_attributes, nil)
@@ -156,6 +178,7 @@ public final class JSRuntime {
             if enableStdModules {
                 js_std_free_handlers(jsInstance)
                 StdModulesGate.release()
+                StdModulesGate.removeHelpersFlag(jsInstance)
             }
             JS_FreeRuntime(jsInstance)
         }
