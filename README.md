@@ -1,12 +1,14 @@
 # QuickJS-Swift
 
-![CI Status](https://github.com/zqqf16/QuickJS-Swift/actions/workflows/swift.yml/badge.svg) 
+![CI Status](https://github.com/zqqf16/QuickJS-Swift/actions/workflows/swift.yml/badge.svg)
 
-Swift bindings to QuickJS. Using **NSRunloop** to implement asynchronization.
+Swift bindings for [QuickJS](https://bellard.org/quickjs/) (`2026-06-04`), with a serial `DispatchQueue` event loop for timers and Promise jobs.
 
-### Usage
+**Current release:** `1.0.0`
 
-#### Execute javascript code
+> QuickJS is single-threaded. All engine access is serialized through the runtime's `JSEventLoop`.
+
+### Quick start
 
 ```swift
 import QuickJS
@@ -14,71 +16,59 @@ import QuickJS
 let runtime = JSRuntime()!
 let context = runtime.createContext()!
 
-let jsCode = "var i = 10; i;"
-let result = context.eval(jsCode).int
-print("Result is \(result!)") //10
+let result = try context.evaluate("1 + 2;")
+print(result.int!) // 3
 ```
 
-#### Create a native module
+### Runtime options
 
 ```swift
-import QuickJS
+let runtime = JSRuntime(options: JSRuntimeOptions(
+    memoryLimit: 8 * 1024 * 1024,
+    enableStdModules: false,   // no std/os/Worker/filesystem loader (default)
+    enableHelpers: true,       // console / print
+    interruptHandler: { shouldStop },
+    flushJobsAfterEval: true
+))!
+```
 
-let runtime = JSRuntime()!
-let context = runtime.createContext()!
+### Native modules
 
-// Create a module named "Magic" with two functions "getMagic" and "getMagic2"
+```swift
 context.module("Magic") {
-    JSModuleFunction("getMagic", argc: 0) { context, this, argc, argv in
-        return 10
-    }
-    JSModuleFunction("getMagic2", argc: 0) { context, this, argc, argv in
-        return 20
-    }
+    JSModuleFunction("getMagic", argc: 0) { _, _, _, _ in 10 }
+    JSModuleValue("version", "1.0")
 }
 
-let getMagic = """
-"use strict";
-import { getMagic, getMagic2 } from 'Magic'
-globalThis.magic = getMagic();
-globalThis.magic2 = getMagic2();
-"""
-
-context.eval(getMagic, type: .module)
-
-let magic = context.eval("magic;").int
-print("Magic is \(magic!)") //10
-
-let magic2 = context.eval("magic2;").int
-print("Magic2 is \(magic2!)") //20
+try context.evaluate("""
+import { getMagic, version } from 'Magic'
+globalThis.magic = getMagic()
+globalThis.version = version
+""", options: EvalOptions(type: .module))
 ```
 
-#### Runloop
+### Timers
 
 ```swift
-let runtime = JSRuntime()!
-let context = runtime.createContext()!
-context.enableRunloop()
-  
-let jsCode = """
-"use strict";
-import * as rl from "Runloop";
-rl.setTimeout(function(){ console.log("Hello Runloop"); }, 3000);
-"""
+context.enableEventLoop()
 
-let _ = context.eval(jsCode, type: .module)
-  
-// waiting for 3 seconds
-// Hello Runloop
+try context.evaluate("""
+setTimeout(() => { console.log("hello") }, 100)
+""")
+```
+
+`enableRunloop()` also installs a compatibility `Runloop` module.
+
+### Bytecode
+
+```swift
+let bytecode = try context.compile("40 + 2;")
+let value = try context.evalBytecode(bytecode)
+print(value.int!) // 42
 ```
 
 ### Swift Package Manager
 
-Add this dependency to your `Package.swift` file:
-
 ```swift
-.package(url: "https://github.com/zqqf16/QuickJS-Swift.git", .branch("master")),
+.package(url: "https://github.com/zqqf16/QuickJS-Swift.git", from: "1.0.0")
 ```
-
-
-

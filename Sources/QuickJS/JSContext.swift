@@ -24,136 +24,327 @@ import Foundation
 import QuickJSC
 
 public class JSContext {
+    // Declaration order matters: deinit runs in reverse.
+    // Free the JS context (`core`) while Swift host/module functions are still alive,
+    // then drop those Swift objects, and finally release the runtime.
+    public let runtime: JSRuntime
+    var hostFunctions: [JSFunction] = []
+    private var modules: [OpaquePointer: JSModule] = [:]
+    private var timersInstalled = false
+    private var runloopModuleInstalled = false
     let core: JSContextWrapper
-    let runtime: JSRuntime
 
-    required init?(_ runtime: JSRuntime, context: OpaquePointer) {
+    init?(_ runtime: JSRuntime, context: OpaquePointer) {
         self.runtime = runtime
         self.core = JSContextWrapper(context)
         self.core.opaque = self
     }
-    
+
+    deinit {
+        runtime.perform {
+            JSTimers.shutdown(for: self)
+            core.opaque = nil
+            // Free the C context while Swift host/module functions are still alive.
+            // Do this explicitly: an extra Swift retain of `core` must not delay
+            // FreeContext until after `runtime` is released.
+            core.freeContext()
+        }
+        // Property teardown: modules / hostFunctions, then runtime.
+    }
+
     public enum EvalType: Int32 {
         case global = 0
         case module = 1
     }
 
+    // MARK: - Eval
+
     @discardableResult
     public func eval(_ jsCode: String, type: EvalType = .global) -> JSValue {
-        let value = JS_Eval(core.context, jsCode, jsCode.lengthOfBytes(using: .utf8), "<Swift>", type.rawValue)
-        return JSValue(core, value: value)
+        eval(jsCode, options: EvalOptions(type: type))
     }
-    
+
     @discardableResult
-    public func call(function: JSValue, argc: Int, argv: JSCValuePointer?) -> JSValue {
-        let result = JS_Call(core.context, function.cValue, .undefined, Int32(argc), argv)
-        let obj = JSValue(core, value: result)
-        if (obj.isException) {
-            if let exception = self.getException() {
-                print(exception)
+    public func eval(_ jsCode: String, options: EvalOptions) -> JSValue {
+        runtime.perform {
+            let value = JS_Eval(
+                core.context,
+                jsCode,
+                jsCode.utf8.count,
+                options.filename,
+                options.rawFlags
+            )
+            let result = makeValue(value)
+            if !result.isException, runtime.options.flushJobsAfterEval {
+                _ = try? flushPendingJobsUnlocked()
             }
+            return result
         }
-        
-        return obj
     }
-    
-    // MARK: Property
-    public func setGlobalProperty(name: String, value: String) {
-        let globalObj = JS_GetGlobalObject(core.context)
-        let jsValue = JS_NewString(core.context, value.cString(using: .utf8))
-        JS_SetPropertyStr(core.context, globalObj, name.cString(using: .utf8), jsValue)
-        
-        JS_FreeValue(core.context, globalObj)
-    }
-    
-    public func hasGlobalProperty(name: String) -> Bool {
-        let globalObj = JS_GetGlobalObject(core.context)
-        
-        let jsValue = JS_GetPropertyStr(core.context, globalObj, name.cString(using: .ascii))
-        
-        defer {
-            JS_FreeValue(core.context, jsValue)
-            JS_FreeValue(core.context, globalObj)
-        }
-        
-        if JS_IsException(jsValue) != 0 || JS_IsUndefined(jsValue) != 0 {
-            return false
-        }
-        
-        return true
-    }
-    
-    // MARK: Module
-    private var modules: [OpaquePointer: JSModule] = [:]
-    private func loadModule(_ cModule: OpaquePointer) {
-        guard let module = self.modules[cModule] else {
-            return
-        }
-        module.load()
-    }
-    
-    static let JS_ModuleInit: JSModuleInitFunction = { (ctx, m) in
-        guard let ctx = ctx,
-              let m = m,
-              let context = ctx.opaqueContext else {
-                  return -1
-              }
-        
-        context.loadModule(m)
-        return 0;
-    }
-    
+
     @discardableResult
-    public func module<T:JSModule>(_ name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) -> T? {
-        guard let cModule = JS_NewCModule(core.context, name, JSContext.JS_ModuleInit) else {
-            return nil
+    public func evaluate(_ jsCode: String, options: EvalOptions = EvalOptions()) throws -> JSValue {
+        try runtime.perform {
+            let value = JS_Eval(
+                core.context,
+                jsCode,
+                jsCode.utf8.count,
+                options.filename,
+                options.rawFlags
+            )
+            let result = makeValue(value)
+            if let error = result.cachedError {
+                throw error
+            }
+            if runtime.options.flushJobsAfterEval {
+                try flushPendingJobsUnlocked()
+            }
+            return result
         }
-        
-        let module = T(self.core, module: cModule, name: name, propertyBuilder)
-        self.modules[cModule] = module
-        return module
     }
-    
-    func flushPendingJobs() {
+
+    public func evaluateResult(_ jsCode: String, options: EvalOptions = EvalOptions()) -> Result<JSValue, JSError> {
+        Result { try evaluate(jsCode, options: options) }
+            .mapError { ($0 as? JSError) ?? .exception(String(describing: $0)) }
+    }
+
+    // MARK: - Bytecode
+
+    public func compile(_ jsCode: String, options: EvalOptions = EvalOptions()) throws -> Data {
+        try runtime.perform {
+            var compileOptions = options
+            compileOptions.compileOnly = true
+            let object = JS_Eval(
+                core.context,
+                jsCode,
+                jsCode.utf8.count,
+                compileOptions.filename,
+                compileOptions.rawFlags
+            )
+            defer { JS_FreeValue(core.context, object) }
+            if JS_IsException(object) != 0 {
+                throw mapException()
+            }
+
+            var size = 0
+            guard let buffer = JS_WriteObject(core.context, &size, object, Int32(JS_WRITE_OBJ_BYTECODE)) else {
+                throw mapException()
+            }
+            defer { js_free(core.context, buffer) }
+            return Data(bytes: buffer, count: size)
+        }
+    }
+
+    @discardableResult
+    public func evalBytecode(_ data: Data) throws -> JSValue {
+        try runtime.perform {
+            let value: JSCValue = data.withUnsafeBytes { raw in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else {
+                    return JSCValue.undefined
+                }
+                return JS_ReadObject(core.context, base, data.count, Int32(JS_READ_OBJ_BYTECODE))
+            }
+            if JS_IsException(value) != 0 {
+                throw mapException()
+            }
+
+            if value.tag == Int64(JS_TAG_MODULE) {
+                if JS_ResolveModule(core.context, value) < 0 {
+                    JS_FreeValue(core.context, value)
+                    throw mapException()
+                }
+            }
+
+            let result = makeValue(JS_EvalFunction(core.context, value))
+            if let error = result.cachedError {
+                throw error
+            }
+            if runtime.options.flushJobsAfterEval {
+                try flushPendingJobsUnlocked()
+            }
+            return result
+        }
+    }
+
+    // MARK: - Call
+
+    @discardableResult
+    public func call(_ function: JSValue, this: JSValue? = nil, arguments: [JSValue] = []) -> JSValue {
+        runtime.perform {
+            let thisValue = this?.cValue ?? JSCValue.undefined
+            var args = arguments.map { $0.cValue }
+            let result: JSCValue
+            if args.isEmpty {
+                result = JS_Call(core.context, function.cValue, thisValue, 0, nil)
+            } else {
+                result = args.withUnsafeMutableBufferPointer { buffer in
+                    JS_Call(core.context, function.cValue, thisValue, Int32(buffer.count), buffer.baseAddress)
+                }
+            }
+            let jsValue = makeValue(result)
+            if !jsValue.isException, runtime.options.flushJobsAfterEval {
+                _ = try? flushPendingJobsUnlocked()
+            }
+            return jsValue
+        }
+    }
+
+    @discardableResult
+    public func call(_ function: JSValue, this: JSValue? = nil, converting arguments: [ConvertibleWithJavascript]) -> JSValue {
+        let jsArgs = arguments.map { $0.jsValue(self) }
+        return call(function, this: this, arguments: jsArgs)
+    }
+
+    // MARK: - Globals
+
+    public func setGlobalProperty<T: ConvertibleWithJavascript>(name: String, value: T) {
+        runtime.perform {
+            let globalObj = JS_GetGlobalObject(core.context)
+            defer { JS_FreeValue(core.context, globalObj) }
+            JS_SetPropertyStr(core.context, globalObj, name, value.jsValue(self).steal())
+        }
+    }
+
+    public func getGlobalProperty(_ name: String) -> JSValue {
+        runtime.perform {
+            let globalObj = JS_GetGlobalObject(core.context)
+            defer { JS_FreeValue(core.context, globalObj) }
+            return makeValue(JS_GetPropertyStr(core.context, globalObj, name))
+        }
+    }
+
+    public func hasGlobalProperty(name: String) -> Bool {
+        let value = getGlobalProperty(name)
+        return !value.isException && JS_IsUndefined(value.cValue) == 0
+    }
+
+    // MARK: - Module
+
+    private func loadModule(_ cModule: OpaquePointer) {
+        modules[cModule]?.load()
+    }
+
+    private static let moduleInit: JSModuleInitFunction = { ctx, m in
+        guard let ctx = ctx, let m = m, let context = ctx.opaqueContext else {
+            return -1
+        }
+        context.loadModule(m)
+        return 0
+    }
+
+    @discardableResult
+    public func module<T: JSModule>(_ name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) -> T? {
+        runtime.perform {
+            guard let cModule = JS_NewCModule(core.context, name, JSContext.moduleInit) else {
+                return nil
+            }
+            let module = T(self, module: cModule, name: name, propertyBuilder)
+            modules[cModule] = module
+            return module
+        }
+    }
+
+    // MARK: - Jobs / Event loop
+
+    public func flushPendingJobs() throws {
+        _ = try runtime.perform {
+            try flushPendingJobsUnlocked()
+        }
+    }
+
+    @discardableResult
+    func flushPendingJobsUnlocked() throws -> Int {
+        var executed = 0
         var ctx: OpaquePointer?
         while true {
-            if JS_ExecutePendingJob(self.runtime.jsInstance, &ctx) <= 0 {
+            let status = JS_ExecutePendingJob(runtime.jsInstance, &ctx)
+            if status == 0 {
                 break
             }
+            if status < 0 {
+                if let ctx = ctx, let jobContext = ctx.opaqueContext {
+                    throw jobContext.mapException()
+                }
+                throw mapException()
+            }
+            executed += 1
+        }
+        return executed
+    }
+
+    public func enableEventLoop() {
+        runtime.perform {
+            guard !timersInstalled else { return }
+            JSTimers.install(on: self)
+            timersInstalled = true
         }
     }
-    
-    // Exception
-    public func getException() -> String? {
-        let exception = JS_GetException(core.context)
-        defer {
-            JS_FreeValue(core.context, exception)
+
+    public func enableRunloop() {
+        enableEventLoop()
+        runtime.perform {
+            guard !runloopModuleInstalled else { return }
+            let _: JSModule? = module("Runloop") {
+                JSModuleFunction("setTimeout", argc: 2) { [weak self] _, _, argc, argv in
+                    guard let self = self else { return nil }
+                    return JSTimers.scheduleTimeout(on: self, argc: argc, argv: argv)
+                }
+                JSModuleFunction("clearTimeout", argc: 1) { [weak self] _, _, argc, argv in
+                    guard let self = self else { return nil }
+                    JSTimers.clearTimeout(on: self, argc: argc, argv: argv)
+                    return nil
+                }
+                JSModuleFunction("setInterval", argc: 2) { [weak self] _, _, argc, argv in
+                    guard let self = self else { return nil }
+                    return JSTimers.scheduleInterval(on: self, argc: argc, argv: argv)
+                }
+                JSModuleFunction("clearInterval", argc: 1) { [weak self] _, _, argc, argv in
+                    guard let self = self else { return nil }
+                    JSTimers.clearTimeout(on: self, argc: argc, argv: argv)
+                    return nil
+                }
+            }
+            runloopModuleInstalled = true
         }
-        
-        let description = String(self.core, value: exception)
+    }
+
+    // MARK: - Exception
+
+    public func getException() -> String? {
+        runtime.perform { exceptionMessage() }
+    }
+
+    func mapException() -> JSError {
+        let message = exceptionMessage() ?? "JavaScript exception"
+        if message.contains("interrupted") {
+            return .interrupted
+        }
+        return .exception(message)
+    }
+
+    func exceptionMessage() -> String? {
+        let exception = JS_GetException(core.context)
+        defer { JS_FreeValue(core.context, exception) }
+
+        let description = String(self, value: exception)
         if JS_IsError(core.context, exception) == 0 {
             return description
         }
-        
+
         let stack = JS_GetPropertyStr(core.context, exception, "stack")
-        defer {
-            JS_FreeValue(core.context, stack)
+        defer { JS_FreeValue(core.context, stack) }
+        let stackStr = String(self, value: stack)
+
+        switch (description, stackStr) {
+        case (nil, nil): return nil
+        case (let d?, nil): return d
+        case (nil, let s?): return s
+        case (let d?, let s?): return "\(d)\n\(s)"
         }
-        
-        let stackStr = String(self.core, value: stack)
-        if description == nil {
-            return stackStr
-        }
-        
-        if stackStr == nil {
-            return description
-        }
-        
-        return "\(description!)\n\(stackStr!)"
     }
-        
-    // Runloop
-    public func enableRunloop() {
-        let _: JSRunloop? = self.module("Runloop", {})
+
+    func clearException() {
+        let exception = JS_GetException(core.context)
+        JS_FreeValue(core.context, exception)
     }
 }

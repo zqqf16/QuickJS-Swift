@@ -42,56 +42,65 @@ extension OpaquePointer {
     }
 }
 
-public class JSContextWrapper {
-    var context: OpaquePointer
-    
+/// Internal owner of a `JSContext *`.
+final class JSContextWrapper {
+    let context: OpaquePointer
+
     init(_ context: OpaquePointer) {
         self.context = context
     }
-    
-    deinit {
+
+    private var didFreeContext = false
+
+    /// Free the underlying `JSContext *`. Safe to call more than once.
+    func freeContext() {
+        guard !didFreeContext else { return }
+        didFreeContext = true
         JS_FreeContext(context)
     }
-    
+
+    deinit {
+        freeContext()
+    }
+
     var opaque: JSContext? {
-        get {
-            return context.opaqueContext
-        }
+        get { context.opaqueContext }
         set {
-            context.opaqueContext = newValue
+            if let jsContext = newValue {
+                let ptr = Unmanaged<JSContext>.passUnretained(jsContext).toOpaque()
+                JS_SetContextOpaque(context, ptr)
+            } else {
+                JS_SetContextOpaque(context, nil)
+            }
         }
     }
-}
 
-// Alloc & Free
-extension JSContextWrapper {
     func free(_ value: JSCValue) {
         JS_FreeValue(context, value)
     }
-    
+
     func dup(_ value: JSCValue) -> JSCValue {
-        return JS_DupValue(context, value)
+        JS_DupValue(context, value)
     }
-    
-    func object() -> JSValue {
-        let obj = JS_NewObject(context)
+
+    func object(classId: JSClassID? = nil) -> JSValue {
+        let obj: JSCValue
+        if let classId = classId {
+            obj = JS_NewObjectClass(context, Int32(classId))
+        } else {
+            obj = JS_NewObject(context)
+        }
         return JSValue(self, value: obj)
     }
-}
 
-// MARK: Function
-extension JSContextWrapper {
-    func function(_ function: @escaping JSCFunctionData, argc: Int32, magic: Int32, length: Int32, data: JSCValuePointer?) -> JSCValue {
-        return JS_NewCFunctionData(context, function, argc, magic, length, data)
+    func function(_ function: @escaping JSCFunctionData, argc: Int32, magic: Int32, length: Int32, data: UnsafeMutablePointer<JSCValue>?) -> JSCValue {
+        JS_NewCFunctionData(context, function, argc, magic, length, data)
     }
-}
 
-// MARK: Module
-extension JSContextWrapper {
     func addExport(module: OpaquePointer, name: String) {
         JS_AddModuleExport(context, module, name)
     }
-    
+
     func setExport(module: OpaquePointer, name: String, value: JSCValue) {
         JS_SetModuleExport(context, module, name, value)
     }

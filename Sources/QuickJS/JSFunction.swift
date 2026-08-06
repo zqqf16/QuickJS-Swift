@@ -23,25 +23,30 @@
 import Foundation
 import QuickJSC
 
-public typealias JSModuleInitFunction = @convention(c) (OpaquePointer?, OpaquePointer?) -> CInt
+typealias JSModuleInitFunction = @convention(c) (OpaquePointer?, OpaquePointer?) -> CInt
+typealias JSCFunctionData = @convention(c) (
+    _ ctx: OpaquePointer?,
+    _ this: JSCValue,
+    _ argc: Int32,
+    _ argv: UnsafeMutablePointer<JSCValue>?,
+    _ magic: Int32,
+    _ data: UnsafeMutablePointer<JSCValue>?
+) -> JSCValue
 
-public typealias JSCFunction = @convention(c) (_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?) -> JSCValue
+public class JSFunction: JSValue {
+    public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: UnsafeMutablePointer<JSCValue>?) -> ConvertibleWithJavascript?
 
-public typealias JSCFunctionData = @convention(c) (_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue
+    public let name: String
+    public let argc: Int32
 
-public class JSFunction : JSValue {
-    public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: JSCValuePointer?) -> ConvertibleWithJavascript?
-    
-    public var name: String
-    public var argc: Int32
-
-    private var block: Block
+    private let block: Block
     private var functionData: JSValue?
-    
+    private var didBuild = false
+
     override var context: JSContextWrapper? {
         didSet {
             if context != nil {
-                self.buildFunction()
+                buildFunction()
             }
         }
     }
@@ -51,47 +56,82 @@ public class JSFunction : JSValue {
         self.argc = argc
         self.block = block
         super.init(context, value: .undefined, autoFree: false)
-        
+
         if context != nil {
-            self.buildFunction()
+            buildFunction()
         }
     }
-    
+
+    @available(*, unavailable, message: "JSFunction cannot wrap an existing JS value")
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
-        fatalError("init(_:value:dup:autoFree) has not been implemented")
+        fatalError("JSFunction cannot wrap an existing JS value")
     }
-    
+
+    @available(*, unavailable, message: "JSFunction cannot wrap an existing JS value")
+    public required convenience init?(_ context: JSContext, value: JSCValue) {
+        fatalError("JSFunction cannot wrap an existing JS value")
+    }
+
     func buildFunction() {
-        guard let context = self.context else {
-            return
-        }
-        
-        self.functionData = context.object()
-        
-        let dataFunction: JSCFunctionData = { (ctx, this, argc, argv, magic, data) -> JSCValue in
-            guard let _ = ctx?.opaqueContext,
+        guard let context = context, !didBuild else { return }
+        didBuild = true
+
+        functionData = context.object(classId: QuickJSClass.functionDataID)
+
+        let dataFunction: JSCFunctionData = { ctx, this, argc, argv, magic, data -> JSCValue in
+            guard ctx?.opaqueContext != nil,
                   let funcData = data,
-                  let mySelfPtr = JS_GetOpaque(funcData[0], 1)
+                  let mySelfPtr = JS_GetOpaque(funcData[0], QuickJSClass.functionDataID)
             else {
                 return .undefined
             }
-            
+
             let mySelf = Unmanaged<JSFunction>.fromOpaque(mySelfPtr).takeUnretainedValue()
             return mySelf.callRealFunction(ctx, this, argc, argv, magic, data)
         }
-        
-        self.functionData!.setOpaque(self)
-        self.cValue = context.function(dataFunction, argc: argc, magic: 0, length: 1, data: &(self.functionData!.cValue))
+
+        // Host keeps the Swift object alive via JSContext/JSModule strong refs.
+        functionData!.setOpaqueUnretained(self)
+        cValue = context.function(dataFunction, argc: argc, magic: 0, length: 1, data: &(functionData!.cValue))
+        // Transfer the data object's ref to the C function (which already dups it).
+        context.free(functionData!.cValue)
+        functionData!.autoFree = false
     }
-    
-    func callRealFunction(_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue {
+
+    func callRealFunction(
+        _ ctx: OpaquePointer?,
+        _ this: JSCValue,
+        _ argc: Int32,
+        _ argv: UnsafeMutablePointer<JSCValue>?,
+        _ magic: Int32,
+        _ data: UnsafeMutablePointer<JSCValue>?
+    ) -> JSCValue {
         guard let context = ctx?.opaqueContext else {
             return .undefined
         }
-        
-        let thisObj = JSValue(context.core, value: this, dup: true)
-        if let result = self.block(context, thisObj, Int(argc), argv) {
-            return result.jsValue(context.core).cValue
+
+        let thisObj = JSValue(context, value: this, dup: true)
+        if let result = block(context, thisObj, Int(argc), argv) {
+            if let error = result as? JSError {
+                return context.makeThrownError(error)
+            }
+            if let value = result as? JSValue {
+                if let error = value.cachedError ?? value.error {
+                    return context.makeThrownError(error)
+                }
+                if JS_IsException(value.cValue) != 0 {
+                    return context.makeThrownError(.exception("JavaScript exception"))
+                }
+                return value.jsValue(context).steal()
+            }
+            let jsValue = result.jsValue(context)
+            if JS_HasException(context.core.context) != 0 {
+                return .exception
+            }
+            return jsValue.steal()
+        }
+        if JS_HasException(context.core.context) != 0 {
+            return .exception
         }
         return .undefined
     }
