@@ -48,7 +48,7 @@ public class JSContext {
     public func call(function: JSValue, argc: Int, argv: JSCValuePointer?) -> JSValue {
         let result = JS_Call(core.context, function.cValue, .undefined, Int32(argc), argv)
         let obj = JSValue(core, value: result)
-        if (obj.isException) {
+        if obj.isException {
             if let exception = self.getException() {
                 print(exception)
             }
@@ -58,29 +58,29 @@ public class JSContext {
     }
     
     // MARK: Property
-    public func setGlobalProperty(name: String, value: String) {
+
+    public func setGlobalProperty<T: ConvertibleWithJavascript>(name: String, value: T) {
         let globalObj = JS_GetGlobalObject(core.context)
-        let jsValue = JS_NewString(core.context, value.cString(using: .utf8))
-        JS_SetPropertyStr(core.context, globalObj, name.cString(using: .utf8), jsValue)
-        
-        JS_FreeValue(core.context, globalObj)
+        defer {
+            JS_FreeValue(core.context, globalObj)
+        }
+
+        let jsValue = value.jsValue(core)
+        JS_SetPropertyStr(core.context, globalObj, name, jsValue.steal())
+    }
+
+    public func getGlobalProperty(_ name: String) -> JSValue {
+        let globalObj = JS_GetGlobalObject(core.context)
+        defer {
+            JS_FreeValue(core.context, globalObj)
+        }
+        let jsValue = JS_GetPropertyStr(core.context, globalObj, name)
+        return JSValue(core, value: jsValue)
     }
     
     public func hasGlobalProperty(name: String) -> Bool {
-        let globalObj = JS_GetGlobalObject(core.context)
-        
-        let jsValue = JS_GetPropertyStr(core.context, globalObj, name.cString(using: .ascii))
-        
-        defer {
-            JS_FreeValue(core.context, jsValue)
-            JS_FreeValue(core.context, globalObj)
-        }
-        
-        if JS_IsException(jsValue) != 0 || JS_IsUndefined(jsValue) != 0 {
-            return false
-        }
-        
-        return true
+        let value = getGlobalProperty(name)
+        return !value.isException && JS_IsUndefined(value.cValue) == 0
     }
     
     // MARK: Module
@@ -100,11 +100,11 @@ public class JSContext {
               }
         
         context.loadModule(m)
-        return 0;
+        return 0
     }
     
     @discardableResult
-    public func module<T:JSModule>(_ name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) -> T? {
+    public func module<T: JSModule>(_ name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) -> T? {
         guard let cModule = JS_NewCModule(core.context, name, JSContext.JS_ModuleInit) else {
             return nil
         }

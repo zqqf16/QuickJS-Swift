@@ -55,7 +55,7 @@ fileprivate struct JSModuleCombineProperty : JSModuleProperty {
     var children: [JSModuleProperty]
     
     init(_ children: [JSModuleProperty]) {
-        self.name = "<DUMY>"
+        self.name = "<DUMMY>"
         self.children = children
     }
     

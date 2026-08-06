@@ -73,8 +73,13 @@ extension JSContextWrapper {
         return JS_DupValue(context, value)
     }
     
-    func object() -> JSValue {
-        let obj = JS_NewObject(context)
+    func object(classId: JSClassID? = nil) -> JSValue {
+        let obj: JSCValue
+        if let classId = classId {
+            obj = JS_NewObjectClass(context, Int32(classId))
+        } else {
+            obj = JS_NewObject(context)
+        }
         return JSValue(self, value: obj)
     }
 }

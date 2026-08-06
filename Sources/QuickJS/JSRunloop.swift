@@ -23,20 +23,24 @@
 import Foundation
 import QuickJSC
 
-struct JSRunloopTimer {
-    var context: OpaquePointer
-    var argc: Int32
-    var argv: UnsafeMutablePointer<JSValue>
-}
-
 final class JSRunloop : JSModule {
     var runloop: RunLoop
+    private var observer: CFRunLoopObserver?
+    private var pendingTimers: [Timer] = []
 
     required init(_ context: JSContextWrapper, module: OpaquePointer, name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) {
         runloop = RunLoop.current
         super.init(context, module: module, name: "Runloop", propertyBuilder)
         self.addObserver()
         self.registerFunctions()
+    }
+
+    deinit {
+        if let observer = observer {
+            CFRunLoopRemoveObserver(runloop.getCFRunLoop(), observer, .defaultMode)
+        }
+        pendingTimers.forEach { $0.invalidate() }
+        pendingTimers.removeAll()
     }
     
     func registerFunctions() {
@@ -48,16 +52,14 @@ final class JSRunloop : JSModule {
     }
     
     func addObserver() {
-        let observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, CFRunLoopActivity.allActivities.rawValue, true, 0) { [weak self] ob, ac in
-            guard let self = self else {
+        let observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, CFRunLoopActivity.beforeTimers.rawValue, true, 0) { [weak self] _, activity in
+            guard let self = self, activity == .beforeTimers else {
                 return
             }
-            if ac == .beforeTimers {
-                self.context?.opaque?.flushPendingJobs()
-            }
+            self.context?.opaque?.flushPendingJobs()
         }
-        let cfRunloop = self.runloop.getCFRunLoop()
-        CFRunLoopAddObserver(cfRunloop, observer, .defaultMode)
+        self.observer = observer
+        CFRunLoopAddObserver(self.runloop.getCFRunLoop(), observer, .defaultMode)
     }
     
     func scheduleTimer(_ argc: Int, _ argv: JSCValuePointer?) {
@@ -69,19 +71,35 @@ final class JSRunloop : JSModule {
         }
         
         let function = JSValue(context, value: arguments[0], dup: true)
-        if !function.isFunction {
+        guard function.isFunction else {
             return
         }
         
-        let interval = JSValue(context, value: arguments[1], dup: true).double ?? 0
+        let intervalMs = JSValue(context, value: arguments[1]).double ?? 0
+        let extraArgc = max(argc - 2, 0)
 
-        if #available(macOS 10.12, *) {
-            let timer = Timer(timeInterval: interval/1000, repeats: false) { timer in
-                context.opaque?.call(function: function, argc: argc-2, argv: arguments+2)
-            }
-            self.runloop.add(timer, forMode: .default)
-        } else {
-            assert(false, "Upgrade your mac version")
+        // Retain callback arguments: argv becomes invalid after the native call returns.
+        var retainedArgs: [JSValue] = []
+        retainedArgs.reserveCapacity(extraArgc)
+        for index in 0..<extraArgc {
+            retainedArgs.append(JSValue(context, value: arguments[2 + index], dup: true))
         }
+
+        let timer = Timer(timeInterval: intervalMs / 1000, repeats: false) { [weak self] timer in
+            defer {
+                self?.pendingTimers.removeAll { $0 === timer }
+            }
+
+            if retainedArgs.isEmpty {
+                context.opaque?.call(function: function, argc: 0, argv: nil)
+            } else {
+                var cArgs = retainedArgs.map { $0.cValue }
+                _ = cArgs.withUnsafeMutableBufferPointer { buffer in
+                    context.opaque?.call(function: function, argc: extraArgc, argv: buffer.baseAddress)
+                }
+            }
+        }
+        pendingTimers.append(timer)
+        self.runloop.add(timer, forMode: .default)
     }
 }

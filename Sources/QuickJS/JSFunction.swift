@@ -50,6 +50,7 @@ public class JSFunction : JSValue {
         self.name = name
         self.argc = argc
         self.block = block
+        // The C function value is owned by the module export / JS heap.
         super.init(context, value: .undefined, autoFree: false)
         
         if context != nil {
@@ -66,12 +67,12 @@ public class JSFunction : JSValue {
             return
         }
         
-        self.functionData = context.object()
+        self.functionData = context.object(classId: QuickJSClass.functionDataID)
         
         let dataFunction: JSCFunctionData = { (ctx, this, argc, argv, magic, data) -> JSCValue in
             guard let _ = ctx?.opaqueContext,
                   let funcData = data,
-                  let mySelfPtr = JS_GetOpaque(funcData[0], 1)
+                  let mySelfPtr = JS_GetOpaque(funcData[0], QuickJSClass.functionDataID)
             else {
                 return .undefined
             }
@@ -91,7 +92,8 @@ public class JSFunction : JSValue {
         
         let thisObj = JSValue(context.core, value: this, dup: true)
         if let result = self.block(context, thisObj, Int(argc), argv) {
-            return result.jsValue(context.core).cValue
+            // Transfer ownership of the returned value to QuickJS.
+            return result.jsValue(context.core).steal()
         }
         return .undefined
     }

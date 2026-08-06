@@ -43,9 +43,10 @@ public class JSRuntime {
             return nil
         }
         self.jsInstance = runtime
-        js_std_set_worker_new_context_func(JSRuntime.contextBuilder);
-        js_std_init_handlers(runtime);
-        JS_SetModuleLoaderFunc2(runtime, nil, js_module_loader, js_module_check_attributes, nil);
+        QuickJSClass.register(on: runtime)
+        js_std_set_worker_new_context_func(JSRuntime.contextBuilder)
+        js_std_init_handlers(runtime)
+        JS_SetModuleLoaderFunc2(runtime, nil, js_module_loader, js_module_check_attributes, nil)
     }
     
     deinit {
