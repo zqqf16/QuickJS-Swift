@@ -25,22 +25,29 @@ import QuickJSC
 
 public protocol JSModuleProperty {
     var name: String { get }
-    var jsValue: JSCValue { get }
-
+    func exportValue(in context: JSContext) -> JSValue
     func add(to context: JSContext)
 }
 
 public class JSModuleFunction: JSFunction, JSModuleProperty {
-    public required init(_ name: String, argc: Int32, block: @escaping Block) {
+    private var didExport = false
+
+    public init(_ name: String, argc: Int32, block: @escaping Block) {
         super.init(nil, name: name, argc: argc, block: block)
     }
 
+    @available(*, unavailable, message: "JSModuleFunction cannot wrap an existing JS value")
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
-        fatalError("init(_:value:dup:autoFree) has not been implemented")
+        fatalError("JSModuleFunction cannot wrap an existing JS value")
     }
 
-    public var jsValue: JSCValue {
-        cValue
+    public func exportValue(in context: JSContext) -> JSValue {
+        // First export transfers ownership of the C function value; later exports dup.
+        if didExport {
+            return JSValue(context.core, value: cValue, dup: true, autoFree: true)
+        }
+        didExport = true
+        return JSValue(context.core, value: cValue, dup: false, autoFree: false)
     }
 
     public func add(to context: JSContext) {
@@ -48,15 +55,37 @@ public class JSModuleFunction: JSFunction, JSModuleProperty {
     }
 }
 
+/// A constant / value export for native modules.
+public struct JSModuleValue: JSModuleProperty {
+    public let name: String
+    private let makeValue: (JSContext) -> JSValue
+
+    public init<T: ConvertibleWithJavascript>(_ name: String, _ value: T) {
+        self.name = name
+        self.makeValue = { context in value.jsValue(context) }
+    }
+
+    public init(_ name: String, builder: @escaping (JSContext) -> JSValue) {
+        self.name = name
+        self.makeValue = builder
+    }
+
+    public func exportValue(in context: JSContext) -> JSValue {
+        makeValue(context)
+    }
+
+    public func add(to context: JSContext) {}
+}
+
 private struct JSModuleCombineProperty: JSModuleProperty {
-    var jsValue: JSCValue = .undefined
-    var name: String
+    var name: String = "<DUMMY>"
     var children: [JSModuleProperty]
 
     init(_ children: [JSModuleProperty]) {
-        self.name = "<DUMMY>"
         self.children = children
     }
+
+    func exportValue(in context: JSContext) -> JSValue { .undefined }
 
     func add(to context: JSContext) {
         children.forEach { $0.add(to: context) }
@@ -70,13 +99,13 @@ public struct ModuleBuilder {
     }
 }
 
-public class JSModule {
-    public var name: String
-    var properties: [String: JSModuleProperty] = [:]
-
-    weak var jsContext: JSContext?
-    var context: JSContextWrapper?
-    var jsInstance: OpaquePointer
+public final class JSModule {
+    public let name: String
+    private(set) var properties: [String: JSModuleProperty] = [:]
+    private weak var jsContext: JSContext?
+    private var context: JSContextWrapper?
+    private var jsInstance: OpaquePointer
+    private var didLoad = false
 
     required init(_ context: JSContext, module: OpaquePointer, name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) {
         self.jsInstance = module
@@ -105,15 +134,34 @@ public class JSModule {
         function.add(to: jsContext)
         properties[name] = function
         addExport(name)
+        if didLoad {
+            setExport(name, value: function.exportValue(in: jsContext))
+        }
+    }
+
+    public func value<T: ConvertibleWithJavascript>(_ name: String, _ value: T) {
+        guard let jsContext = jsContext else { return }
+        let property = JSModuleValue(name, value)
+        properties[name] = property
+        addExport(name)
+        if didLoad {
+            setExport(name, value: property.exportValue(in: jsContext))
+        }
     }
 
     func addExport(_ name: String) {
         context?.addExport(module: jsInstance, name: name)
     }
 
+    func setExport(_ name: String, value: JSValue) {
+        context?.setExport(module: jsInstance, name: name, value: value.steal())
+    }
+
     func load() {
+        guard let jsContext = jsContext else { return }
+        didLoad = true
         for (key, value) in properties {
-            context?.setExport(module: jsInstance, name: key, value: value.jsValue)
+            setExport(key, value: value.exportValue(in: jsContext))
         }
     }
 }

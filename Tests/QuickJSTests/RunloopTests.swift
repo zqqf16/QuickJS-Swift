@@ -2,42 +2,53 @@ import XCTest
 @testable import QuickJS
 
 final class RunloopTests: XCTestCase {
-    func testSetTimeoutAndClear() throws {
+    func testSetTimeoutClearAndInterval() throws {
         let runtime = try XCTUnwrap(JSRuntime())
         let context = try XCTUnwrap(runtime.createContext())
         context.enableEventLoop()
 
-        let expectation = XCTestExpectation(description: "timeout fired")
+        let timeoutExpectation = expectation(description: "timeout")
+        let intervalExpectation = expectation(description: "interval")
+        intervalExpectation.expectedFulfillmentCount = 2
 
         context.module("Waiter") {
-            JSModuleFunction("timeIsUp", argc: 1) { _, _, argc, argv in
+            JSModuleFunction("onTimeout", argc: 1) { _, _, argc, argv in
                 XCTAssertGreaterThanOrEqual(argc, 1)
                 if let argv = argv {
                     XCTAssertEqual(String(context, value: argv[0]), "ok")
                 }
-                expectation.fulfill()
+                timeoutExpectation.fulfill()
+                return nil
+            }
+            JSModuleFunction("onInterval", argc: 0) { _, _, _, _ in
+                intervalExpectation.fulfill()
                 return nil
             }
         }
 
-        let script = """
-        "use strict";
-        import { timeIsUp } from "Waiter";
-        const id = setTimeout(function(msg){ timeIsUp(msg); }, 150, "ok");
-        const cancelled = setTimeout(function(){ throw new Error("should be cleared"); }, 50);
-        clearTimeout(cancelled);
-        """
+        try context.evaluate("""
+        import { onTimeout, onInterval } from "Waiter"
+        const cancelled = setTimeout(() => { throw new Error("cleared") }, 20)
+        clearTimeout(cancelled)
+        setTimeout(msg => onTimeout(msg), 80, "ok")
+        let n = 0
+        const id = setInterval(() => {
+          n += 1
+          onInterval()
+          if (n >= 2) clearInterval(id)
+        }, 40)
+        """, options: EvalOptions(type: .module))
 
-        XCTAssertNil(context.eval(script, type: .module).error)
-        wait(for: [expectation], timeout: 2)
+        wait(for: [timeoutExpectation, intervalExpectation], timeout: 2)
     }
 
     func testRunloopModuleCompat() throws {
         let runtime = try XCTUnwrap(JSRuntime())
         let context = try XCTUnwrap(runtime.createContext())
         context.enableRunloop()
+        context.enableRunloop() // should be idempotent
 
-        let expectation = XCTestExpectation(description: "module timeout")
+        let expectation = expectation(description: "module timeout")
         context.module("Waiter") {
             JSModuleFunction("done", argc: 0) { _, _, _, _ in
                 expectation.fulfill()
@@ -45,18 +56,17 @@ final class RunloopTests: XCTestCase {
             }
         }
 
-        let script = """
-        "use strict";
-        import * as runloop from "Runloop";
-        import { done } from "Waiter";
-        runloop.setTimeout(function(){ done(); }, 100);
-        """
-        XCTAssertNil(context.eval(script, type: .module).error)
+        try context.evaluate("""
+        import * as runloop from "Runloop"
+        import { done } from "Waiter"
+        runloop.setTimeout(() => done(), 50)
+        """, options: EvalOptions(type: .module))
+
         wait(for: [expectation], timeout: 2)
     }
 
     static var allTests = [
-        ("testSetTimeoutAndClear", testSetTimeoutAndClear),
+        ("testSetTimeoutClearAndInterval", testSetTimeoutClearAndInterval),
         ("testRunloopModuleCompat", testRunloopModuleCompat),
     ]
 }

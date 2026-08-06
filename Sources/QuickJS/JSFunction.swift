@@ -23,19 +23,23 @@
 import Foundation
 import QuickJSC
 
-public typealias JSModuleInitFunction = @convention(c) (OpaquePointer?, OpaquePointer?) -> CInt
-
-public typealias JSCFunction = @convention(c) (_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?) -> JSCValue
-
-public typealias JSCFunctionData = @convention(c) (_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue
+typealias JSModuleInitFunction = @convention(c) (OpaquePointer?, OpaquePointer?) -> CInt
+typealias JSCFunctionData = @convention(c) (
+    _ ctx: OpaquePointer?,
+    _ this: JSCValue,
+    _ argc: Int32,
+    _ argv: UnsafeMutablePointer<JSCValue>?,
+    _ magic: Int32,
+    _ data: UnsafeMutablePointer<JSCValue>?
+) -> JSCValue
 
 public class JSFunction: JSValue {
-    public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: JSCValuePointer?) -> ConvertibleWithJavascript?
+    public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: UnsafeMutablePointer<JSCValue>?) -> ConvertibleWithJavascript?
 
-    public var name: String
-    public var argc: Int32
+    public let name: String
+    public let argc: Int32
 
-    private var block: Block
+    private let block: Block
     private var functionData: JSValue?
     private var didBuild = false
 
@@ -51,8 +55,6 @@ public class JSFunction: JSValue {
         self.name = name
         self.argc = argc
         self.block = block
-        // Ownership of the JS function value is transferred to the module export
-        // or global property that publishes it.
         super.init(context, value: .undefined, autoFree: false)
 
         if context != nil {
@@ -60,8 +62,9 @@ public class JSFunction: JSValue {
         }
     }
 
+    @available(*, unavailable, message: "JSFunction cannot wrap an existing JS value")
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
-        fatalError("init(_:value:dup:autoFree) has not been implemented")
+        fatalError("JSFunction cannot wrap an existing JS value")
     }
 
     func buildFunction() {
@@ -82,13 +85,22 @@ public class JSFunction: JSValue {
             return mySelf.callRealFunction(ctx, this, argc, argv, magic, data)
         }
 
-        // Lifetime: the Swift `JSFunction` must be retained by `JSContext` /
-        // `JSModule` for as long as the JS function is reachable.
+        // Host keeps the Swift object alive via JSContext/JSModule strong refs.
         functionData!.setOpaqueUnretained(self)
         cValue = context.function(dataFunction, argc: argc, magic: 0, length: 1, data: &(functionData!.cValue))
+        // Transfer the data object's ref to the C function (which already dups it).
+        context.free(functionData!.cValue)
+        functionData!.autoFree = false
     }
 
-    func callRealFunction(_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue {
+    func callRealFunction(
+        _ ctx: OpaquePointer?,
+        _ this: JSCValue,
+        _ argc: Int32,
+        _ argv: UnsafeMutablePointer<JSCValue>?,
+        _ magic: Int32,
+        _ data: UnsafeMutablePointer<JSCValue>?
+    ) -> JSCValue {
         guard let context = ctx?.opaqueContext else {
             return .undefined
         }

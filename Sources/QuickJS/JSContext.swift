@@ -24,26 +24,31 @@ import Foundation
 import QuickJSC
 
 public class JSContext {
-    // Declaration order matters: deinit runs in reverse, so `runtime` must outlive
-    // `core` (JS_FreeContext before JS_FreeRuntime).
+    // Declaration order matters: deinit runs in reverse.
+    // Free the JS context (`core`) while Swift host/module functions are still alive,
+    // then drop those Swift objects, and finally release the runtime.
     public let runtime: JSRuntime
-    let core: JSContextWrapper
-    private var modules: [OpaquePointer: JSModule] = [:]
-    /// Strong refs for host functions installed as globals (timers, etc.).
     var hostFunctions: [JSFunction] = []
+    private var modules: [OpaquePointer: JSModule] = [:]
     private var timersInstalled = false
+    private var runloopModuleInstalled = false
+    let core: JSContextWrapper
 
-    required init?(_ runtime: JSRuntime, context: OpaquePointer) {
+    init?(_ runtime: JSRuntime, context: OpaquePointer) {
         self.runtime = runtime
         self.core = JSContextWrapper(context)
         self.core.opaque = self
     }
 
     deinit {
-        // Drop Swift-owned host callbacks before freeing the JS context.
-        hostFunctions.removeAll()
-        modules.removeAll()
-        core.opaque = nil
+        runtime.perform {
+            JSTimers.shutdown(for: self)
+            core.opaque = nil
+        }
+        // Property teardown order (reverse declaration):
+        // core → FreeContext (Swift functions still retained)
+        // modules / hostFunctions → release Swift callbacks
+        // runtime → may FreeRuntime when last context goes away
     }
 
     public enum EvalType: Int32 {
@@ -68,18 +73,33 @@ public class JSContext {
                 options.filename,
                 options.rawFlags
             )
-            return JSValue(core, value: value)
+            let result = JSValue(core, value: value)
+            if runtime.options.flushJobsAfterEval {
+                _ = try? flushPendingJobsUnlocked()
+            }
+            return result
         }
     }
 
-    /// Evaluate JavaScript and throw on exception.
     @discardableResult
     public func evaluate(_ jsCode: String, options: EvalOptions = EvalOptions()) throws -> JSValue {
-        let value = eval(jsCode, options: options)
-        if value.isException {
-            throw JSError.exception(exceptionMessage() ?? "JavaScript exception")
+        try runtime.perform {
+            let value = JS_Eval(
+                core.context,
+                jsCode,
+                jsCode.utf8.count,
+                options.filename,
+                options.rawFlags
+            )
+            let result = JSValue(core, value: value)
+            if result.isException {
+                throw mapException()
+            }
+            if runtime.options.flushJobsAfterEval {
+                try flushPendingJobsUnlocked()
+            }
+            return result
         }
-        return value
     }
 
     public func evaluateResult(_ jsCode: String, options: EvalOptions = EvalOptions()) -> Result<JSValue, JSError> {
@@ -89,7 +109,6 @@ public class JSContext {
 
     // MARK: - Bytecode
 
-    /// Compile JavaScript to QuickJS bytecode.
     public func compile(_ jsCode: String, options: EvalOptions = EvalOptions()) throws -> Data {
         try runtime.perform {
             var compileOptions = options
@@ -103,19 +122,18 @@ public class JSContext {
             )
             defer { JS_FreeValue(core.context, object) }
             if JS_IsException(object) != 0 {
-                throw JSError.exception(exceptionMessage() ?? "Compile failed")
+                throw mapException()
             }
 
             var size = 0
             guard let buffer = JS_WriteObject(core.context, &size, object, Int32(JS_WRITE_OBJ_BYTECODE)) else {
-                throw JSError.exception(exceptionMessage() ?? "Bytecode serialization failed")
+                throw mapException()
             }
             defer { js_free(core.context, buffer) }
             return Data(bytes: buffer, count: size)
         }
     }
 
-    /// Load and evaluate previously compiled bytecode.
     @discardableResult
     public func evalBytecode(_ data: Data) throws -> JSValue {
         try runtime.perform {
@@ -126,33 +144,54 @@ public class JSContext {
                 return JS_ReadObject(core.context, base, data.count, Int32(JS_READ_OBJ_BYTECODE))
             }
             if JS_IsException(value) != 0 {
-                throw JSError.exception(exceptionMessage() ?? "Bytecode load failed")
+                throw mapException()
             }
 
             if value.tag == Int64(JS_TAG_MODULE) {
                 if JS_ResolveModule(core.context, value) < 0 {
                     JS_FreeValue(core.context, value)
-                    throw JSError.exception(exceptionMessage() ?? "Module resolve failed")
+                    throw mapException()
                 }
             }
 
-            let result = JS_EvalFunction(core.context, value)
-            let jsValue = JSValue(core, value: result)
-            if jsValue.isException {
-                throw JSError.exception(exceptionMessage() ?? "Bytecode eval failed")
+            let result = JSValue(core, value: JS_EvalFunction(core.context, value))
+            if result.isException {
+                throw mapException()
             }
-            return jsValue
+            if runtime.options.flushJobsAfterEval {
+                try flushPendingJobsUnlocked()
+            }
+            return result
         }
     }
 
     // MARK: - Call
 
     @discardableResult
-    public func call(function: JSValue, argc: Int, argv: JSCValuePointer?) -> JSValue {
+    public func call(_ function: JSValue, this: JSValue? = nil, arguments: [JSValue] = []) -> JSValue {
         runtime.perform {
-            let result = JS_Call(core.context, function.cValue, .undefined, Int32(argc), argv)
-            return JSValue(core, value: result)
+            let thisValue = this?.cValue ?? JSCValue.undefined
+            var args = arguments.map { $0.cValue }
+            let result: JSCValue
+            if args.isEmpty {
+                result = JS_Call(core.context, function.cValue, thisValue, 0, nil)
+            } else {
+                result = args.withUnsafeMutableBufferPointer { buffer in
+                    JS_Call(core.context, function.cValue, thisValue, Int32(buffer.count), buffer.baseAddress)
+                }
+            }
+            let jsValue = JSValue(core, value: result)
+            if runtime.options.flushJobsAfterEval {
+                _ = try? flushPendingJobsUnlocked()
+            }
+            return jsValue
         }
+    }
+
+    @discardableResult
+    public func call(_ function: JSValue, this: JSValue? = nil, converting arguments: [ConvertibleWithJavascript]) -> JSValue {
+        let jsArgs = arguments.map { $0.jsValue(self) }
+        return call(function, this: this, arguments: jsArgs)
     }
 
     // MARK: - Globals
@@ -206,14 +245,29 @@ public class JSContext {
 
     // MARK: - Jobs / Event loop
 
-    public func flushPendingJobs() {
-        runtime.perform {
-            var ctx: OpaquePointer?
-            while JS_ExecutePendingJob(runtime.jsInstance, &ctx) > 0 {}
+    public func flushPendingJobs() throws {
+        _ = try runtime.perform {
+            try flushPendingJobsUnlocked()
         }
     }
 
-    /// Install `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval` globals.
+    @discardableResult
+    func flushPendingJobsUnlocked() throws -> Int {
+        var executed = 0
+        var ctx: OpaquePointer?
+        while true {
+            let status = JS_ExecutePendingJob(runtime.jsInstance, &ctx)
+            if status == 0 {
+                break
+            }
+            if status < 0 {
+                throw mapException()
+            }
+            executed += 1
+        }
+        return executed
+    }
+
     public func enableEventLoop() {
         runtime.perform {
             guard !timersInstalled else { return }
@@ -222,15 +276,14 @@ public class JSContext {
         }
     }
 
-    /// Backward-compatible alias of `enableEventLoop()`, also exposes a `Runloop` module.
     public func enableRunloop() {
         enableEventLoop()
         runtime.perform {
+            guard !runloopModuleInstalled else { return }
             let _: JSModule? = module("Runloop") {
                 JSModuleFunction("setTimeout", argc: 2) { [weak self] _, _, argc, argv in
                     guard let self = self else { return nil }
                     return JSTimers.scheduleTimeout(on: self, argc: argc, argv: argv)
-                        .map { $0 as ConvertibleWithJavascript }
                 }
                 JSModuleFunction("clearTimeout", argc: 1) { [weak self] _, _, argc, argv in
                     guard let self = self else { return nil }
@@ -240,7 +293,6 @@ public class JSContext {
                 JSModuleFunction("setInterval", argc: 2) { [weak self] _, _, argc, argv in
                     guard let self = self else { return nil }
                     return JSTimers.scheduleInterval(on: self, argc: argc, argv: argv)
-                        .map { $0 as ConvertibleWithJavascript }
                 }
                 JSModuleFunction("clearInterval", argc: 1) { [weak self] _, _, argc, argv in
                     guard let self = self else { return nil }
@@ -248,6 +300,7 @@ public class JSContext {
                     return nil
                 }
             }
+            runloopModuleInstalled = true
         }
     }
 
@@ -255,6 +308,14 @@ public class JSContext {
 
     public func getException() -> String? {
         runtime.perform { exceptionMessage() }
+    }
+
+    func mapException() -> JSError {
+        let message = exceptionMessage() ?? "JavaScript exception"
+        if message.contains("interrupted") {
+            return .interrupted
+        }
+        return .exception(message)
     }
 
     func exceptionMessage() -> String? {
@@ -276,5 +337,10 @@ public class JSContext {
         case (nil, let s?): return s
         case (let d?, let s?): return "\(d)\n\(s)"
         }
+    }
+
+    func clearException() {
+        let exception = JS_GetException(core.context)
+        JS_FreeValue(core.context, exception)
     }
 }

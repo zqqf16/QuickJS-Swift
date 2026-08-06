@@ -31,6 +31,7 @@ enum JSTimers {
 
     private final class TimerState {
         var entries: [UInt64: (handle: JSTimerID, function: JSValue, args: [JSValue])] = [:]
+        var alive = true
     }
 
     private static func state(for context: JSContext) -> TimerState {
@@ -45,6 +46,21 @@ enum JSTimers {
         return created
     }
 
+    /// Cancel all timers and drop retained JS values for a context.
+    static func shutdown(for context: JSContext) {
+        let key = ObjectIdentifier(context)
+        lock.lock()
+        let state = states.removeValue(forKey: key)
+        state?.alive = false
+        let entries = state?.entries ?? [:]
+        state?.entries.removeAll()
+        lock.unlock()
+
+        for (_, entry) in entries {
+            context.runtime.eventLoop.cancel(entry.handle)
+        }
+    }
+
     static func install(on context: JSContext) {
         _ = state(for: context)
 
@@ -53,19 +69,18 @@ enum JSTimers {
             context.hostFunctions.append(function)
             let globalObj = JS_GetGlobalObject(context.core.context)
             defer { JS_FreeValue(context.core.context, globalObj) }
-            // Transfer ownership of the JS function to the global object.
             _ = JS_SetPropertyStr(context.core.context, globalObj, name, function.cValue)
         }
 
         installGlobal(name: "setTimeout", argc: 2) { ctx, _, argc, argv in
-            scheduleTimeout(on: ctx, argc: argc, argv: argv).map { $0 as ConvertibleWithJavascript }
+            scheduleTimeout(on: ctx, argc: argc, argv: argv)
         }
         installGlobal(name: "clearTimeout", argc: 1) { ctx, _, argc, argv in
             clearTimeout(on: ctx, argc: argc, argv: argv)
             return nil
         }
         installGlobal(name: "setInterval", argc: 2) { ctx, _, argc, argv in
-            scheduleInterval(on: ctx, argc: argc, argv: argv).map { $0 as ConvertibleWithJavascript }
+            scheduleInterval(on: ctx, argc: argc, argv: argv)
         }
         installGlobal(name: "clearInterval", argc: 1) { ctx, _, argc, argv in
             clearTimeout(on: ctx, argc: argc, argv: argv)
@@ -73,28 +88,29 @@ enum JSTimers {
         }
     }
 
-    static func scheduleTimeout(on context: JSContext, argc: Int, argv: JSCValuePointer?) -> Int64? {
+    static func scheduleTimeout(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?) -> Int64? {
         schedule(on: context, argc: argc, argv: argv, repeating: false)
     }
 
-    static func scheduleInterval(on context: JSContext, argc: Int, argv: JSCValuePointer?) -> Int64? {
+    static func scheduleInterval(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?) -> Int64? {
         schedule(on: context, argc: argc, argv: argv, repeating: true)
     }
 
-    static func clearTimeout(on context: JSContext, argc: Int, argv: JSCValuePointer?) {
+    static func clearTimeout(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?) {
         guard let argv = argv, argc >= 1 else { return }
         var id: Int64 = 0
         if JS_ToInt64(context.core.context, &id, argv[0]) < 0 { return }
         cancel(on: context, id: UInt64(bitPattern: id))
     }
 
-    private static func schedule(on context: JSContext, argc: Int, argv: JSCValuePointer?, repeating: Bool) -> Int64? {
+    private static func schedule(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?, repeating: Bool) -> Int64? {
         guard let argv = argv, argc >= 2 else { return nil }
 
         let function = JSValue(context.core, value: argv[0], dup: true)
         guard function.isFunction else { return nil }
 
-        let delayMs = JSValue(context.core, value: argv[1]).double ?? 0
+        let rawDelay = JSValue(context.core, value: argv[1]).double ?? 0
+        let delayMs = rawDelay.isFinite ? max(rawDelay, 0) : 0
         let extraArgc = max(argc - 2, 0)
         var args: [JSValue] = []
         args.reserveCapacity(extraArgc)
@@ -110,37 +126,35 @@ enum JSTimers {
 
         let handle = context.runtime.eventLoop.schedule(after: delayMs / 1000, repeating: repeating) { [weak context] in
             guard let context = context else { return }
-            context.flushPendingJobs()
 
             let snapshot: (JSValue, [JSValue])? = {
                 lock.lock()
                 defer { lock.unlock() }
-                guard let entry = state.entries[timerKey] else { return nil }
+                guard state.alive, let entry = state.entries[timerKey] else { return nil }
                 return (entry.function, entry.args)
             }()
 
             guard let (fn, retainedArgs) = snapshot else { return }
 
-            if retainedArgs.isEmpty {
-                _ = context.call(function: fn, argc: 0, argv: nil)
-            } else {
-                var cArgs = retainedArgs.map { $0.cValue }
-                _ = cArgs.withUnsafeMutableBufferPointer { buffer in
-                    context.call(function: fn, argc: retainedArgs.count, argv: buffer.baseAddress)
-                }
-            }
+            _ = try? context.flushPendingJobs()
+            _ = context.call(fn, arguments: retainedArgs)
 
             if !repeating {
                 cancel(on: context, id: timerKey)
             } else {
-                context.flushPendingJobs()
+                _ = try? context.flushPendingJobs()
             }
         }
 
         lock.lock()
-        state.entries[timerKey] = (handle, function, args)
+        if state.alive {
+            state.entries[timerKey] = (handle, function, args)
+            lock.unlock()
+            return Int64(bitPattern: timerKey)
+        }
         lock.unlock()
-        return Int64(bitPattern: timerKey)
+        context.runtime.eventLoop.cancel(handle)
+        return nil
     }
 
     private static func cancel(on context: JSContext, id: UInt64) {

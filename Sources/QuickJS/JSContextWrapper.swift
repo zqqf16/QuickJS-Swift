@@ -84,7 +84,7 @@ final class JSContextWrapper {
         return JSValue(self, value: obj)
     }
 
-    func function(_ function: @escaping JSCFunctionData, argc: Int32, magic: Int32, length: Int32, data: JSCValuePointer?) -> JSCValue {
+    func function(_ function: @escaping JSCFunctionData, argc: Int32, magic: Int32, length: Int32, data: UnsafeMutablePointer<JSCValue>?) -> JSCValue {
         JS_NewCFunctionData(context, function, argc, magic, length, data)
     }
 

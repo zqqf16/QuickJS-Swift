@@ -24,7 +24,6 @@ import Foundation
 import QuickJSC
 
 public typealias JSCValue = QuickJSC.JSValue
-public typealias JSCValuePointer = UnsafeMutablePointer<JSCValue>
 
 // MARK: - JSValue
 
@@ -54,7 +53,6 @@ public class JSValue {
         }
     }
 
-    /// Transfer ownership of the underlying `JSValue` to the caller.
     func steal() -> JSCValue {
         autoFree = false
         return cValue
@@ -63,13 +61,6 @@ public class JSValue {
     func setOpaqueUnretained<T: AnyObject>(_ obj: T, classId: JSClassID = QuickJSClass.functionDataID) {
         let ptr = Unmanaged<T>.passUnretained(obj).toOpaque()
         JS_SetOpaque(cValue, ptr)
-    }
-
-    func getOpaque<T: AnyObject>(classId: JSClassID = QuickJSClass.functionDataID) -> T? {
-        guard let ptr = JS_GetOpaque(cValue, classId) else {
-            return nil
-        }
-        return Unmanaged<T>.fromOpaque(ptr).takeUnretainedValue()
     }
 
     deinit {
@@ -96,13 +87,17 @@ extension JSValue {
     public var isBool: Bool { JS_IsBool(cValue) != 0 }
     public var isNumber: Bool { JS_IsNumber(cValue) != 0 }
     public var isString: Bool { JS_IsString(cValue) != 0 }
+    public var isObject: Bool { JS_IsObject(cValue) != 0 }
 
     public var isArray: Bool {
         guard let ctx = context?.context else { return false }
         return JS_IsArray(ctx, cValue) != 0
     }
 
-    public var isObject: Bool { JS_IsObject(cValue) != 0 }
+    public var isDate: Bool {
+        guard let jsContext = jsContext else { return false }
+        return jsContext.isDate(cValue)
+    }
 
     public func getValue<T: ConvertibleWithJavascript>() -> T? {
         guard let jsContext = jsContext else { return nil }
@@ -118,7 +113,7 @@ extension JSValue {
 
     public var error: JSError? {
         guard isException, let jsContext = jsContext else { return nil }
-        return JSError.exception(jsContext.exceptionMessage() ?? "JavaScript exception")
+        return jsContext.mapException()
     }
 }
 
@@ -130,16 +125,12 @@ public protocol ConvertibleWithJavascript {
 }
 
 extension ConvertibleWithJavascript {
-    public func jsValue(_ context: JSContext) -> JSValue {
-        .undefined
-    }
+    public func jsValue(_ context: JSContext) -> JSValue { .undefined }
 }
 
 extension String: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard let cString = JS_ToCString(context.core.context, value) else {
-            return nil
-        }
+        guard let cString = JS_ToCString(context.core.context, value) else { return nil }
         self.init(cString: cString)
         JS_FreeCString(context.core.context, cString)
     }
@@ -213,12 +204,15 @@ extension Int: ConvertibleWithJavascript {
 
 extension UInt: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard let valueIn32 = UInt32(context, value: value) else { return nil }
-        self.init(valueIn32)
+        guard let valueIn64 = Int64(context, value: value), valueIn64 >= 0 else { return nil }
+        self.init(UInt64(valueIn64))
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        UInt32(self).jsValue(context)
+        if self <= UInt(Int64.max) {
+            return Int64(self).jsValue(context)
+        }
+        return Double(self).jsValue(context)
     }
 }
 
@@ -285,17 +279,13 @@ extension Dictionary: ConvertibleWithJavascript where Key == String, Value: Conv
         guard let tab = tab else { return }
         for i in 0..<len {
             let atom = tab[Int(i)].atom
-            guard let keyCString = JS_AtomToCString(context.core.context, atom) else {
-                return nil
-            }
+            guard let keyCString = JS_AtomToCString(context.core.context, atom) else { return nil }
             let key = String(cString: keyCString)
             JS_FreeCString(context.core.context, keyCString)
 
             let prop = JS_GetProperty(context.core.context, value, atom)
             defer { context.core.free(prop) }
-            guard let converted = Value(context, value: prop) else {
-                return nil
-            }
+            guard let converted = Value(context, value: prop) else { return nil }
             self[key] = converted
         }
     }
@@ -321,8 +311,11 @@ extension Data: ConvertibleWithJavascript {
         var length = 0
         var bytesPerElement = 0
         let buffer = JS_GetTypedArrayBuffer(context.core.context, value, &offset, &length, &bytesPerElement)
+        if JS_IsException(buffer) != 0 {
+            context.clearException()
+            return nil
+        }
         defer { context.core.free(buffer) }
-        guard JS_IsException(buffer) == 0 else { return nil }
 
         var bufferSize = 0
         guard let ptr = JS_GetArrayBuffer(context.core.context, &bufferSize, buffer) else {
@@ -344,13 +337,16 @@ extension Data: ConvertibleWithJavascript {
 
 extension Date: ConvertibleWithJavascript {
     public init?(_ context: JSContext, value: JSCValue) {
-        guard JS_IsObject(value) != 0 else { return nil }
+        guard context.isDate(value) else { return nil }
 
         let atom = JS_NewAtom(context.core.context, "valueOf")
         defer { JS_FreeAtom(context.core.context, atom) }
         let result = JS_Invoke(context.core.context, value, atom, 0, nil)
         defer { context.core.free(result) }
-        guard JS_IsException(result) == 0 else { return nil }
+        guard JS_IsException(result) == 0 else {
+            context.clearException()
+            return nil
+        }
 
         var millis: Double = 0
         if JS_ToFloat64(context.core.context, &millis, result) < 0 { return nil }
@@ -358,8 +354,7 @@ extension Date: ConvertibleWithJavascript {
     }
 
     public func jsValue(_ context: JSContext) -> JSValue {
-        let millis = timeIntervalSince1970 * 1000
-        return JSValue(context.core, value: JS_NewDate(context.core.context, millis))
+        JSValue(context.core, value: JS_NewDate(context.core.context, timeIntervalSince1970 * 1000))
     }
 }
 
@@ -374,5 +369,22 @@ public enum JSError: Error, Equatable {
         case .conversionFailed: return "Value conversion failed"
         case .interrupted: return "JavaScript execution interrupted"
         }
+    }
+}
+
+extension JSContext {
+    func isDate(_ value: JSCValue) -> Bool {
+        guard JS_IsObject(value) != 0 else { return false }
+        let globalObj = JS_GetGlobalObject(core.context)
+        defer { JS_FreeValue(core.context, globalObj) }
+        let dateCtor = JS_GetPropertyStr(core.context, globalObj, "Date")
+        defer { JS_FreeValue(core.context, dateCtor) }
+        guard JS_IsFunction(core.context, dateCtor) != 0 else { return false }
+        let result = JS_IsInstanceOf(core.context, value, dateCtor)
+        if result < 0 {
+            clearException()
+            return false
+        }
+        return result != 0
     }
 }

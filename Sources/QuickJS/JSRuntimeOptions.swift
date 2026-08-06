@@ -31,23 +31,33 @@ public struct JSRuntimeOptions {
     /// Soft memory limit in bytes. `nil` means no limit.
     public var memoryLimit: Int?
 
-    /// When true, install QuickJS `std` / `os` modules, helpers (`console`, etc.),
-    /// and the file-based ES module loader.
+    /// Install QuickJS `std` / `os` modules, the file-based ES module loader,
+    /// and worker handlers.
     ///
-    /// Disable this for embedded hosts that do not want filesystem / process APIs.
+    /// Defaults to `false` for safer embedding (no filesystem / process / Worker).
     public var enableStdModules: Bool
+
+    /// Install `console` / `print` helpers via `js_std_add_helpers`.
+    public var enableHelpers: Bool
 
     /// Called periodically during JS execution. Return `true` to interrupt.
     public var interruptHandler: (() -> Bool)?
 
+    /// Drain Promise jobs automatically after eval / call.
+    public var flushJobsAfterEval: Bool
+
     public init(
         memoryLimit: Int? = nil,
-        enableStdModules: Bool = true,
-        interruptHandler: (() -> Bool)? = nil
+        enableStdModules: Bool = false,
+        enableHelpers: Bool = true,
+        interruptHandler: (() -> Bool)? = nil,
+        flushJobsAfterEval: Bool = true
     ) {
         self.memoryLimit = memoryLimit
         self.enableStdModules = enableStdModules
+        self.enableHelpers = enableHelpers
         self.interruptHandler = interruptHandler
+        self.flushJobsAfterEval = flushJobsAfterEval
     }
 }
 
@@ -58,19 +68,23 @@ public struct EvalOptions {
     public var strict: Bool
     public var compileOnly: Bool
     public var backtraceBarrier: Bool
+    /// Allow top-level await in global scripts (`JS_EVAL_FLAG_ASYNC`).
+    public var async: Bool
 
     public init(
         type: JSContext.EvalType = .global,
         filename: String = "<Swift>",
         strict: Bool = false,
         compileOnly: Bool = false,
-        backtraceBarrier: Bool = false
+        backtraceBarrier: Bool = false,
+        async: Bool = false
     ) {
         self.type = type
         self.filename = filename
         self.strict = strict
         self.compileOnly = compileOnly
         self.backtraceBarrier = backtraceBarrier
+        self.async = async
     }
 
     var rawFlags: Int32 {
@@ -78,6 +92,7 @@ public struct EvalOptions {
         if strict { flags |= JS_EVAL_FLAG_STRICT }
         if compileOnly { flags |= JS_EVAL_FLAG_COMPILE_ONLY }
         if backtraceBarrier { flags |= JS_EVAL_FLAG_BACKTRACE_BARRIER }
+        if async { flags |= JS_EVAL_FLAG_ASYNC }
         return flags
     }
 }

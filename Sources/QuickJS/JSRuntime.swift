@@ -25,9 +25,32 @@ import QuickJSC
 
 private final class InterruptBox {
     var handler: () -> Bool
+    init(_ handler: @escaping () -> Bool) { self.handler = handler }
+}
 
-    init(_ handler: @escaping () -> Bool) {
-        self.handler = handler
+private final class RejectionBox {
+    var lastMessage: String?
+}
+
+/// Ref-counts process-global QuickJS std worker hooks.
+private enum StdModulesGate {
+    private static let lock = NSLock()
+    private static var refCount = 0
+
+    static func acquire(builder: @escaping @convention(c) (OpaquePointer?) -> OpaquePointer?) {
+        lock.lock()
+        defer { lock.unlock() }
+        refCount += 1
+        js_std_set_worker_new_context_func(builder)
+    }
+
+    static func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        refCount = max(refCount - 1, 0)
+        if refCount == 0 {
+            js_std_set_worker_new_context_func(nil)
+        }
     }
 }
 
@@ -36,13 +59,15 @@ private final class InterruptBox {
 /// - Important: QuickJS is single-threaded. Always access the runtime and its
 ///   contexts through `perform` / the associated `eventLoop`, or via the
 ///   public `JSContext` APIs which already serialize work.
-public class JSRuntime {
-    public private(set) var jsInstance: OpaquePointer
+public final class JSRuntime {
+    let jsInstance: OpaquePointer
     public let eventLoop: JSEventLoop
     public let options: JSRuntimeOptions
 
     private let interruptBox: InterruptBox?
+    private let rejectionBox: RejectionBox
     private let enableStdModules: Bool
+    private var isShutdown = false
 
     private static let cInterrupt: @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?) -> Int32 = { _, opaque in
         guard let opaque = opaque else { return 0 }
@@ -50,11 +75,19 @@ public class JSRuntime {
         return box.handler() ? 1 : 0
     }
 
-    private static let contextBuilder: @convention(c) (OpaquePointer?) -> OpaquePointer? = { rt in
-        guard let rt = rt, let ctx = JS_NewContext(rt) else {
-            return nil
+    private static let cRejection: @convention(c) (OpaquePointer?, JSCValue, JSCValue, Int32, UnsafeMutableRawPointer?) -> Void = { ctx, _, reason, isHandled, opaque in
+        guard isHandled == 0, let opaque = opaque, let ctx = ctx else { return }
+        let box = Unmanaged<RejectionBox>.fromOpaque(opaque).takeUnretainedValue()
+        if let cString = JS_ToCString(ctx, reason) {
+            box.lastMessage = String(cString: cString)
+            JS_FreeCString(ctx, cString)
+        } else {
+            box.lastMessage = "Unhandled promise rejection"
         }
-        // Workers always get std helpers when this builder is installed.
+    }
+
+    private static let contextBuilder: @convention(c) (OpaquePointer?) -> OpaquePointer? = { rt in
+        guard let rt = rt, let ctx = JS_NewContext(rt) else { return nil }
         _ = js_init_module_std(ctx, "std")
         _ = js_init_module_os(ctx, "os")
         js_std_add_helpers(ctx, -1, nil)
@@ -66,14 +99,13 @@ public class JSRuntime {
     }
 
     public init?(options: JSRuntimeOptions = JSRuntimeOptions(), eventLoop: JSEventLoop? = nil) {
-        guard let runtime = JS_NewRuntime() else {
-            return nil
-        }
+        guard let runtime = JS_NewRuntime() else { return nil }
 
         self.jsInstance = runtime
         self.options = options
         self.enableStdModules = options.enableStdModules
         self.eventLoop = eventLoop ?? DispatchEventLoop()
+        self.rejectionBox = RejectionBox()
 
         QuickJSClass.register(on: runtime)
 
@@ -89,27 +121,50 @@ public class JSRuntime {
             self.interruptBox = nil
         }
 
+        JS_SetHostPromiseRejectionTracker(
+            runtime,
+            JSRuntime.cRejection,
+            Unmanaged.passUnretained(rejectionBox).toOpaque()
+        )
+
         if options.enableStdModules {
-            js_std_set_worker_new_context_func(JSRuntime.contextBuilder)
+            StdModulesGate.acquire(builder: JSRuntime.contextBuilder)
             js_std_init_handlers(runtime)
             JS_SetModuleLoaderFunc2(runtime, nil, js_module_loader, js_module_check_attributes, nil)
         }
     }
 
     deinit {
-        JS_SetInterruptHandler(jsInstance, nil, nil)
-        if enableStdModules {
-            js_std_free_handlers(jsInstance)
-        }
-        JS_FreeRuntime(jsInstance)
+        shutdown()
     }
 
-    /// Run work on the runtime's serial event loop.
+    /// Consume the last unhandled promise rejection message, if any.
+    public func takeUnhandledPromiseRejection() -> String? {
+        perform {
+            let message = rejectionBox.lastMessage
+            rejectionBox.lastMessage = nil
+            return message
+        }
+    }
+
+    func shutdown() {
+        eventLoop.sync {
+            guard !isShutdown else { return }
+            isShutdown = true
+            JS_SetInterruptHandler(jsInstance, nil, nil)
+            JS_SetHostPromiseRejectionTracker(jsInstance, nil, nil)
+            if enableStdModules {
+                js_std_free_handlers(jsInstance)
+                StdModulesGate.release()
+            }
+            JS_FreeRuntime(jsInstance)
+        }
+    }
+
     public func perform<T>(_ body: () throws -> T) rethrows -> T {
         try eventLoop.sync(body)
     }
 
-    /// Schedule work on the runtime's serial event loop.
     public func async(_ body: @escaping () -> Void) {
         eventLoop.async(body)
     }
@@ -121,10 +176,11 @@ public class JSRuntime {
                 ctx = JSRuntime.contextBuilder(jsInstance)
             } else {
                 ctx = JS_NewContext(jsInstance)
+                if options.enableHelpers, let ctx = ctx {
+                    js_std_add_helpers(ctx, -1, nil)
+                }
             }
-            guard let context = ctx else {
-                return nil
-            }
+            guard let context = ctx else { return nil }
             return JSContext(self, context: context)
         }
     }

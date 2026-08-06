@@ -75,9 +75,10 @@ public final class DispatchEventLoop: JSEventLoop {
         lock.unlock()
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        let interval = max(delay, 0)
+        let interval = delay.isFinite ? max(delay, 0) : 0
         if repeating {
-            timer.schedule(deadline: .now() + interval, repeating: interval)
+            let repeatInterval = interval == 0 ? 0.001 : interval
+            timer.schedule(deadline: .now() + interval, repeating: repeatInterval)
         } else {
             timer.schedule(deadline: .now() + interval, repeating: .never)
         }
