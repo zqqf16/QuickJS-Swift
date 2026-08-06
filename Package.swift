@@ -21,7 +21,15 @@ let package = Package(
         .target(
             name: "QuickJSC",
             dependencies: [],
-            path: "Sources/QuickJSC"),
+            path: "Sources/QuickJSC",
+            exclude: [
+                "VERSION",
+                "QUICKJS_LICENSE",
+            ],
+            cSettings: [
+                .define("CONFIG_VERSION", to: "\"2026-06-04\""),
+                .define("_GNU_SOURCE"),
+            ]),
         .target(
             name: "QuickJS",
             dependencies: ["QuickJSC"]),

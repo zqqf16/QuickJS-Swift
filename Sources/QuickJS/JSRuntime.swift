@@ -32,7 +32,7 @@ public class JSRuntime {
         }
         
         let _ = js_init_module_std(ctx, "std")
-        let _ = js_init_module_std(ctx, "os")
+        let _ = js_init_module_os(ctx, "os")
         js_std_add_helpers(ctx, -1, nil)
 
         return ctx
@@ -45,10 +45,11 @@ public class JSRuntime {
         self.jsInstance = runtime
         js_std_set_worker_new_context_func(JSRuntime.contextBuilder);
         js_std_init_handlers(runtime);
-        JS_SetModuleLoaderFunc(runtime, nil, js_module_loader, nil);
+        JS_SetModuleLoaderFunc2(runtime, nil, js_module_loader, js_module_check_attributes, nil);
     }
     
     deinit {
+        js_std_free_handlers(self.jsInstance)
         JS_FreeRuntime(self.jsInstance)
     }
     

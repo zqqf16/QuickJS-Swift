@@ -30,11 +30,11 @@ public typealias JSCValuePointer = UnsafeMutablePointer<JSCValue>
 
 extension JSCValue {
     static var null: JSCValue {
-        return JSCValue(u: JSValueUnion(int32: 0), tag: Int64(JS_TAG_NULL))
+        return JSCValue(u: JSValueUnion(uint64: 0), tag: Int64(JS_TAG_NULL))
     }
     
     static var undefined: JSCValue {
-        return JSCValue(u: JSValueUnion(int32: 0), tag: Int64(JS_TAG_UNDEFINED))
+        return JSCValue(u: JSValueUnion(uint64: 0), tag: Int64(JS_TAG_UNDEFINED))
     }
 }
 
