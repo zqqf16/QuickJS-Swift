@@ -29,19 +29,20 @@ public typealias JSCFunction = @convention(c) (_ ctx: OpaquePointer?, _ this: JS
 
 public typealias JSCFunctionData = @convention(c) (_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue
 
-public class JSFunction : JSValue {
+public class JSFunction: JSValue {
     public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: JSCValuePointer?) -> ConvertibleWithJavascript?
-    
+
     public var name: String
     public var argc: Int32
 
     private var block: Block
     private var functionData: JSValue?
-    
+    private var didBuild = false
+
     override var context: JSContextWrapper? {
         didSet {
             if context != nil {
-                self.buildFunction()
+                buildFunction()
             }
         }
     }
@@ -50,50 +51,51 @@ public class JSFunction : JSValue {
         self.name = name
         self.argc = argc
         self.block = block
-        // The C function value is owned by the module export / JS heap.
+        // Ownership of the JS function value is transferred to the module export
+        // or global property that publishes it.
         super.init(context, value: .undefined, autoFree: false)
-        
+
         if context != nil {
-            self.buildFunction()
+            buildFunction()
         }
     }
-    
+
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
         fatalError("init(_:value:dup:autoFree) has not been implemented")
     }
-    
+
     func buildFunction() {
-        guard let context = self.context else {
-            return
-        }
-        
-        self.functionData = context.object(classId: QuickJSClass.functionDataID)
-        
-        let dataFunction: JSCFunctionData = { (ctx, this, argc, argv, magic, data) -> JSCValue in
-            guard let _ = ctx?.opaqueContext,
+        guard let context = context, !didBuild else { return }
+        didBuild = true
+
+        functionData = context.object(classId: QuickJSClass.functionDataID)
+
+        let dataFunction: JSCFunctionData = { ctx, this, argc, argv, magic, data -> JSCValue in
+            guard ctx?.opaqueContext != nil,
                   let funcData = data,
                   let mySelfPtr = JS_GetOpaque(funcData[0], QuickJSClass.functionDataID)
             else {
                 return .undefined
             }
-            
+
             let mySelf = Unmanaged<JSFunction>.fromOpaque(mySelfPtr).takeUnretainedValue()
             return mySelf.callRealFunction(ctx, this, argc, argv, magic, data)
         }
-        
-        self.functionData!.setOpaque(self)
-        self.cValue = context.function(dataFunction, argc: argc, magic: 0, length: 1, data: &(self.functionData!.cValue))
+
+        // Lifetime: the Swift `JSFunction` must be retained by `JSContext` /
+        // `JSModule` for as long as the JS function is reachable.
+        functionData!.setOpaqueUnretained(self)
+        cValue = context.function(dataFunction, argc: argc, magic: 0, length: 1, data: &(functionData!.cValue))
     }
-    
+
     func callRealFunction(_ ctx: OpaquePointer?, _ this: JSCValue, _ argc: Int32, _ argv: JSCValuePointer?, _ magic: Int32, _ data: JSCValuePointer?) -> JSCValue {
         guard let context = ctx?.opaqueContext else {
             return .undefined
         }
-        
+
         let thisObj = JSValue(context.core, value: this, dup: true)
-        if let result = self.block(context, thisObj, Int(argc), argv) {
-            // Transfer ownership of the returned value to QuickJS.
-            return result.jsValue(context.core).steal()
+        if let result = block(context, thisObj, Int(argc), argv) {
+            return result.jsValue(context).steal()
         }
         return .undefined
     }

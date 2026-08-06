@@ -23,53 +23,50 @@
 import Foundation
 import QuickJSC
 
-
 public protocol JSModuleProperty {
     var name: String { get }
     var jsValue: JSCValue { get }
-    
-    func add(toContext context: JSContextWrapper)
+
+    func add(to context: JSContext)
 }
 
-public class JSModuleFunction : JSFunction, JSModuleProperty {
-    required public init(_ name: String, argc: Int32, block: @escaping Block) {
+public class JSModuleFunction: JSFunction, JSModuleProperty {
+    public required init(_ name: String, argc: Int32, block: @escaping Block) {
         super.init(nil, name: name, argc: argc, block: block)
     }
-    
+
     required init(_ context: JSContextWrapper?, value: JSCValue, dup: Bool = false, autoFree: Bool = true) {
         fatalError("init(_:value:dup:autoFree) has not been implemented")
     }
-    
+
     public var jsValue: JSCValue {
-        return self.cValue
+        cValue
     }
-    
-    public func add(toContext context: JSContextWrapper) {
-        self.context = context
+
+    public func add(to context: JSContext) {
+        self.context = context.core
     }
 }
 
-fileprivate struct JSModuleCombineProperty : JSModuleProperty {
+private struct JSModuleCombineProperty: JSModuleProperty {
     var jsValue: JSCValue = .undefined
     var name: String
     var children: [JSModuleProperty]
-    
+
     init(_ children: [JSModuleProperty]) {
         self.name = "<DUMMY>"
         self.children = children
     }
-    
-    func add(toContext context: JSContextWrapper) {
-        self.children.forEach { obj in
-            obj.add(toContext: context)
-        }
+
+    func add(to context: JSContext) {
+        children.forEach { $0.add(to: context) }
     }
 }
 
 @resultBuilder
 public struct ModuleBuilder {
     public static func buildBlock(_ components: JSModuleProperty...) -> JSModuleProperty {
-        return JSModuleCombineProperty(components)
+        JSModuleCombineProperty(components)
     }
 }
 
@@ -77,43 +74,45 @@ public class JSModule {
     public var name: String
     var properties: [String: JSModuleProperty] = [:]
 
+    weak var jsContext: JSContext?
     var context: JSContextWrapper?
     var jsInstance: OpaquePointer
-    
-    required init(_ context: JSContextWrapper, module: OpaquePointer, name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) {
+
+    required init(_ context: JSContext, module: OpaquePointer, name: String, @ModuleBuilder _ propertyBuilder: () -> JSModuleProperty) {
         self.jsInstance = module
-        self.context = context
+        self.jsContext = context
+        self.context = context.core
         self.name = name
-        
+
         let property = propertyBuilder()
-        if property is JSModuleCombineProperty {
-            let children = (property as! JSModuleCombineProperty).children
-            children.forEach { obj in
-                self.properties[obj.name] = obj
+        if let combined = property as? JSModuleCombineProperty {
+            for obj in combined.children {
+                properties[obj.name] = obj
             }
         } else {
-            self.properties[property.name] = property
+            properties[property.name] = property
         }
-        
-        self.properties.forEach { (key, value) in
-            value.add(toContext: self.context!)
-            self.addExport(key)
+
+        for (key, value) in properties {
+            value.add(to: context)
+            addExport(key)
         }
     }
 
     public func function(_ name: String, argc: Int32, block: @escaping JSFunction.Block) {
+        guard let jsContext = jsContext else { return }
         let function = JSModuleFunction(name, argc: argc, block: block)
-        function.add(toContext: self.context!)
-        self.properties[name] = function
-        self.addExport(name)
+        function.add(to: jsContext)
+        properties[name] = function
+        addExport(name)
     }
-    
+
     func addExport(_ name: String) {
         context?.addExport(module: jsInstance, name: name)
     }
-    
+
     func load() {
-        self.properties.forEach { (key, value) in
+        for (key, value) in properties {
             context?.setExport(module: jsInstance, name: key, value: value.jsValue)
         }
     }
