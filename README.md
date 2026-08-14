@@ -32,6 +32,10 @@ let runtime = JSRuntime(options: JSRuntimeOptions(
 ))!
 ```
 
+`enableStdModules` is only honored on macOS and Linux; on iOS/tvOS/watchOS the
+`std`/`os` modules, filesystem loader, and Worker handlers are unavailable and
+this option is ignored.
+
 ### Native modules
 
 ```swift
@@ -58,6 +62,9 @@ setTimeout(() => { console.log("hello") }, 100)
 ```
 
 `enableRunloop()` also installs a compatibility `Runloop` module.
+
+Dropping the last reference to a `JSContext` cancels any pending timers
+automatically — pending timers do not keep the context alive.
 
 ### Bytecode
 

@@ -41,7 +41,12 @@ extension JSCValue {
     }
 }
 
-public class JSValue {
+/// A reference-counted Swift wrapper around a QuickJS `JSValue`.
+///
+/// All engine calls on the wrapped value are routed through the owning
+/// runtime's `JSEventLoop`, so instances may be shared across threads.
+/// Marked `@unchecked Sendable` for that reason.
+public class JSValue: @unchecked Sendable {
     var cValue: JSCValue
     /// Backing wrapper for host-function values that must not strongly retain `JSContext`
     /// (the context already retains those functions).
@@ -191,13 +196,15 @@ extension JSValue: ConvertibleWithJavascript {
 
 // MARK: - ConvertibleWithJavascript
 
+/// A type that can be produced from a JavaScript value and exported back into
+/// JavaScript.
+///
+/// Both requirements are mandatory: `init?(_:value:)` converts *from* JS and
+/// `jsValue(_:)` converts *to* JS. There is no default `jsValue`, so a
+/// conforming type cannot silently degrade to `undefined`.
 public protocol ConvertibleWithJavascript {
     init?(_ context: JSContext, value: JSCValue)
     func jsValue(_ context: JSContext) -> JSValue
-}
-
-extension ConvertibleWithJavascript {
-    public func jsValue(_ context: JSContext) -> JSValue { .undefined }
 }
 
 extension String: ConvertibleWithJavascript {

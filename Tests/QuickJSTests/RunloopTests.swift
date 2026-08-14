@@ -87,10 +87,4 @@ final class RunloopTests: XCTestCase {
         wait(for: [expectation], timeout: 2)
         XCTAssertEqual(try context.evaluate("1 + 1;").int, 2)
     }
-
-    static var allTests = [
-        ("testSetTimeoutClearAndInterval", testSetTimeoutClearAndInterval),
-        ("testRunloopModuleCompat", testRunloopModuleCompat),
-        ("testSetTimeoutStringDelayAndCallbackException", testSetTimeoutStringDelayAndCallbackException),
-    ]
 }

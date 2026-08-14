@@ -35,7 +35,12 @@ public struct JSTimerID: Hashable {
 ///
 /// QuickJS is not thread-safe. All engine access must go through a single
 /// `JSEventLoop` instance associated with the runtime.
-public protocol JSEventLoop: AnyObject {
+///
+/// - Important: implementations of `sync` must support re-entrancy — when
+///   called from the loop's own thread, `sync` must run `work` inline rather
+///   than blocking on itself. `DispatchEventLoop` does this via a dispatch
+///   specific key. `JSContext.deinit` and `JSValue.deinit` rely on it.
+public protocol JSEventLoop: AnyObject, Sendable {
     func async(_ work: @escaping () -> Void)
     func sync<T>(_ work: () throws -> T) rethrows -> T
     func schedule(after delay: TimeInterval, repeating: Bool, _ work: @escaping () -> Void) -> JSTimerID
@@ -43,7 +48,7 @@ public protocol JSEventLoop: AnyObject {
 }
 
 /// Default event loop backed by a serial `DispatchQueue`.
-public final class DispatchEventLoop: JSEventLoop {
+public final class DispatchEventLoop: JSEventLoop, @unchecked Sendable {
     public let queue: DispatchQueue
 
     private let specificKey = DispatchSpecificKey<UInt8>()

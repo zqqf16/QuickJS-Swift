@@ -24,6 +24,9 @@ let package = Package(
                 "VERSION",
                 "QUICKJS_LICENSE",
             ],
+            // CONFIG_VERSION must match Sources/QuickJSC/VERSION and
+            // `quickJSCVersion` in Sources/QuickJS/Version.swift (verified by
+            // `testVersionConsistency`). Keep the three in sync when upgrading.
             cSettings: [
                 .define("CONFIG_VERSION", to: "\"2026-06-04\""),
                 .define("_GNU_SOURCE"),

@@ -78,7 +78,10 @@ private enum StdModulesGate {
 /// - Important: QuickJS is single-threaded. Always access the runtime and its
 ///   contexts through `perform` / the associated `eventLoop`, or via the
 ///   public `JSContext` APIs which already serialize work.
-public final class JSRuntime {
+///
+/// Marked `@unchecked Sendable` because all mutable state is serialized through
+/// the single `JSEventLoop`; callers may hand the instance across threads.
+public final class JSRuntime: @unchecked Sendable {
     let jsInstance: OpaquePointer
     public let eventLoop: JSEventLoop
     public let options: JSRuntimeOptions
@@ -126,7 +129,14 @@ public final class JSRuntime {
 
         self.jsInstance = runtime
         self.options = options
+        // `std` / `os` / filesystem module loader and Worker handlers install
+        // POSIX signal handlers and call into process/filesystem APIs that are
+        // unavailable (or unsafe) outside macOS and Linux.
+        #if os(macOS) || os(Linux)
         self.enableStdModules = options.enableStdModules
+        #else
+        self.enableStdModules = false
+        #endif
         self.eventLoop = eventLoop ?? DispatchEventLoop()
         self.rejectionBox = RejectionBox()
 
@@ -186,10 +196,18 @@ public final class JSRuntime {
         }
     }
 
+    /// Run `body` on the runtime's serial event loop and return its result.
+    ///
+    /// This is safe to call from any thread, including the event loop's own
+    /// thread. `JSEventLoop.sync` implementations are required to support
+    /// re-entrancy (running `body` inline when already on the loop), exactly as
+    /// `DispatchEventLoop` does, so deinit paths that call `perform` do not
+    /// deadlock.
     public func perform<T>(_ body: () throws -> T) rethrows -> T {
         try eventLoop.sync(body)
     }
 
+    /// Schedule `body` on the runtime's serial event loop without blocking.
     public func async(_ body: @escaping () -> Void) {
         eventLoop.async(body)
     }

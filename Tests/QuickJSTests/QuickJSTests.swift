@@ -113,10 +113,13 @@ final class QuickJSSwiftTests: XCTestCase {
 
     func testTimerTeardown() throws {
         let runtime = try XCTUnwrap(JSRuntime())
+        weak var weakContext: JSContext?
         var context: JSContext? = runtime.createContext()
+        weakContext = context
         context?.enableEventLoop()
         try context?.evaluate("setInterval(() => {}, 10)")
         context = nil
+        XCTAssertNil(weakContext, "A pending interval must not keep the context alive")
         // Giving the queue a moment must not crash after teardown.
         let expectation = expectation(description: "delay")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -195,6 +198,35 @@ final class QuickJSSwiftTests: XCTestCase {
         XCTAssertNil(runtime.takeUnhandledPromiseRejection())
     }
 
+    func testStdModules() throws {
+        #if os(macOS) || os(Linux)
+        let runtime = try XCTUnwrap(JSRuntime(options: JSRuntimeOptions(enableStdModules: true, enableHelpers: false)))
+        let context = try XCTUnwrap(runtime.createContext())
+
+        try context.evaluate("""
+        import * as std from 'std'
+        import * as os from 'os'
+        globalThis.stdOK = typeof std.exit === 'function'
+        globalThis.osOK = typeof os.now === 'function'
+        """, options: EvalOptions(type: .module))
+
+        XCTAssertEqual(context.eval("stdOK;").bool, true)
+        XCTAssertEqual(context.eval("osOK;").bool, true)
+        #endif
+    }
+
+    func testVersionConsistency() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repo = testFile
+            .deletingLastPathComponent()   // QuickJSTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+        let versionFile = repo.appendingPathComponent("Sources/QuickJSC/VERSION")
+        let content = try String(contentsOf: versionFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(content, quickJSCVersion)
+    }
+
     func testJSValueKeepsContextAlive() throws {
         var value: QuickJS.JSValue?
         weak var weakContext: JSContext?
@@ -213,18 +245,4 @@ final class QuickJSSwiftTests: XCTestCase {
         XCTAssertNil(weakContext)
         XCTAssertNil(weakRuntime)
     }
-
-    static var allTests = [
-        ("testEvalAndGlobals", testEvalAndGlobals),
-        ("testNativeModuleAndValues", testNativeModuleAndValues),
-        ("testConversions", testConversions),
-        ("testCallWithThis", testCallWithThis),
-        ("testInterrupt", testInterrupt),
-        ("testBytecodeAndPromises", testBytecodeAndPromises),
-        ("testTimerTeardown", testTimerTeardown),
-        ("testExceptionDoesNotPoisonContext", testExceptionDoesNotPoisonContext),
-        ("testHostThrowAndJSValueReturn", testHostThrowAndJSValueReturn),
-        ("testPromiseRejectionTracker", testPromiseRejectionTracker),
-        ("testJSValueKeepsContextAlive", testJSValueKeepsContextAlive),
-    ]
 }

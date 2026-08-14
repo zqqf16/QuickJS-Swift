@@ -27,7 +27,6 @@ import QuickJSC
 enum JSTimers {
     private static var states = [ObjectIdentifier: TimerState]()
     private static let lock = NSLock()
-    private static var nextKey: UInt64 = 1
 
     private final class TimerState {
         var entries: [UInt64: (handle: JSTimerID, function: JSValue, args: [JSValue])] = [:]
@@ -109,7 +108,12 @@ enum JSTimers {
     private static func schedule(on context: JSContext, argc: Int, argv: UnsafeMutablePointer<JSCValue>?, repeating: Bool) -> Int64? {
         guard let argv = argv, argc >= 2 else { return nil }
 
-        let function = JSValue(context, value: argv[0], dup: true)
+        // Use the wrapper-based initializer so the retained `JSValue`s do not
+        // strongly retain the `JSContext`. Otherwise a pending timer would keep
+        // the context (and runtime) alive forever via the static `states` table,
+        // preventing `JSContext.deinit` — and therefore `JSTimers.shutdown` —
+        // from ever running.
+        let function = JSValue(context.core, value: argv[0], dup: true)
         guard function.isFunction else { return nil }
 
         // Coerce delay without taking ownership of argv[1].
@@ -123,14 +127,13 @@ enum JSTimers {
         var args: [JSValue] = []
         args.reserveCapacity(extraArgc)
         for i in 0..<extraArgc {
-            args.append(JSValue(context, value: argv[2 + i], dup: true))
+            args.append(JSValue(context.core, value: argv[2 + i], dup: true))
         }
 
         let state = state(for: context)
-        lock.lock()
-        let timerKey = nextKey
-        nextKey += 1
-        lock.unlock()
+        // Captured by reference so the closure can read the event loop's ID
+        // after `schedule` returns; the event loop owns the single ID counter.
+        var timerKey: UInt64 = 0
 
         let handle = context.runtime.eventLoop.schedule(after: delayMs / 1000, repeating: repeating) { [weak context] in
             guard let context = context else { return }
@@ -155,6 +158,8 @@ enum JSTimers {
                 _ = try? context.flushPendingJobs()
             }
         }
+
+        timerKey = handle.rawValue
 
         lock.lock()
         if state.alive {

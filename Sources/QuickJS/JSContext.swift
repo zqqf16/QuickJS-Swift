@@ -23,7 +23,12 @@
 import Foundation
 import QuickJSC
 
-public class JSContext {
+/// A JavaScript execution context within a `JSRuntime`.
+///
+/// QuickJS is single-threaded; every public method here serializes its work
+/// through the owning runtime's `JSEventLoop`. Instances are therefore safe to
+/// share across threads and are marked `@unchecked Sendable`.
+public class JSContext: @unchecked Sendable {
     // Declaration order matters: deinit runs in reverse.
     // Free the JS context (`core`) while Swift host/module functions are still alive,
     // then drop those Swift objects, and finally release the runtime.
@@ -57,6 +62,16 @@ public class JSContext {
         case module = 1
     }
 
+    /// Materialize a NUL-terminated UTF-8 buffer once and reuse it for both the
+    /// C pointer and the byte length, instead of bridging the `String` and
+    /// walking `.utf8.count` as two separate passes.
+    private func jsEval(_ jsCode: String, options: EvalOptions) -> JSCValue {
+        let utf8 = jsCode.utf8CString
+        return utf8.withUnsafeBufferPointer { buffer in
+            JS_Eval(core.context, buffer.baseAddress, buffer.count - 1, options.filename, options.rawFlags)
+        }
+    }
+
     // MARK: - Eval
 
     @discardableResult
@@ -64,17 +79,12 @@ public class JSContext {
         eval(jsCode, options: EvalOptions(type: type))
     }
 
+    /// Evaluate `jsCode` without throwing. Exceptions are surfaced as a
+    /// returned `JSValue` whose `isException` is `true` (see `error`).
     @discardableResult
     public func eval(_ jsCode: String, options: EvalOptions) -> JSValue {
         runtime.perform {
-            let value = JS_Eval(
-                core.context,
-                jsCode,
-                jsCode.utf8.count,
-                options.filename,
-                options.rawFlags
-            )
-            let result = makeValue(value)
+            let result = makeValue(jsEval(jsCode, options: options))
             if !result.isException, runtime.options.flushJobsAfterEval {
                 _ = try? flushPendingJobsUnlocked()
             }
@@ -82,17 +92,11 @@ public class JSContext {
         }
     }
 
+    /// Evaluate `jsCode` and throw a `JSError` on failure.
     @discardableResult
     public func evaluate(_ jsCode: String, options: EvalOptions = EvalOptions()) throws -> JSValue {
         try runtime.perform {
-            let value = JS_Eval(
-                core.context,
-                jsCode,
-                jsCode.utf8.count,
-                options.filename,
-                options.rawFlags
-            )
-            let result = makeValue(value)
+            let result = makeValue(jsEval(jsCode, options: options))
             if let error = result.cachedError {
                 throw error
             }
@@ -114,13 +118,7 @@ public class JSContext {
         try runtime.perform {
             var compileOptions = options
             compileOptions.compileOnly = true
-            let object = JS_Eval(
-                core.context,
-                jsCode,
-                jsCode.utf8.count,
-                compileOptions.filename,
-                compileOptions.rawFlags
-            )
+            let object = jsEval(jsCode, options: compileOptions)
             defer { JS_FreeValue(core.context, object) }
             if JS_IsException(object) != 0 {
                 throw mapException()

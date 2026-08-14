@@ -26,15 +26,19 @@ import QuickJSC
 /// Registered QuickJS classes used by the Swift bindings.
 enum QuickJSClass {
     /// Class for objects that store a Swift `JSFunction` opaque pointer.
-    private(set) static var functionDataID: JSClassID = 0
+    ///
+    /// Allocated once via a lazy `static let` so concurrent `JSRuntime` creation
+    /// cannot race on `JS_NewClassID` (QuickJS's class-ID counter is not
+    /// thread-safe).
+    static let functionDataID: JSClassID = {
+        var id: JSClassID = 0
+        JS_NewClassID(&id)
+        return id
+    }()
 
     private static let functionDataClassName = strdup("SwiftFunctionData")!
 
     static func register(on runtime: OpaquePointer) {
-        if functionDataID == 0 {
-            JS_NewClassID(&functionDataID)
-        }
-
         guard JS_IsRegisteredClass(runtime, functionDataID) == 0 else {
             return
         }

@@ -35,6 +35,10 @@ public struct JSRuntimeOptions {
     /// and worker handlers.
     ///
     /// Defaults to `false` for safer embedding (no filesystem / process / Worker).
+    ///
+    /// - Note: Only honored on macOS and Linux. `std`/`os` install POSIX signal
+    ///   handlers and call into process/filesystem APIs that are unavailable or
+    ///   unsafe on iOS, tvOS, and watchOS, where this option is ignored.
     public var enableStdModules: Bool
 
     /// Install `console` / `print` helpers via `js_std_add_helpers`.

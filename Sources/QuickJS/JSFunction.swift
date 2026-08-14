@@ -33,7 +33,7 @@ typealias JSCFunctionData = @convention(c) (
     _ data: UnsafeMutablePointer<JSCValue>?
 ) -> JSCValue
 
-public class JSFunction: JSValue {
+public class JSFunction: JSValue, @unchecked Sendable {
     public typealias Block = (_ context: JSContext, _ this: JSValue, _ argc: Int, _ argv: UnsafeMutablePointer<JSCValue>?) -> ConvertibleWithJavascript?
 
     public let name: String

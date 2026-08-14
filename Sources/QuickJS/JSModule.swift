@@ -29,7 +29,7 @@ public protocol JSModuleProperty {
     func add(to context: JSContext)
 }
 
-public class JSModuleFunction: JSFunction, JSModuleProperty {
+public class JSModuleFunction: JSFunction, JSModuleProperty, @unchecked Sendable {
     private var didExport = false
 
     public init(_ name: String, argc: Int32, block: @escaping Block) {
@@ -104,7 +104,7 @@ public struct ModuleBuilder {
     }
 }
 
-public final class JSModule {
+public final class JSModule: @unchecked Sendable {
     public let name: String
     private(set) var properties: [String: JSModuleProperty] = [:]
     private weak var jsContext: JSContext?
